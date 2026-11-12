@@ -51,8 +51,10 @@ use style::computed_value_flags::ComputedValueFlags;
 use style::data::{ElementData as StyloElementData, ElementStyles};
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::media_queries::MediaType;
-use style::properties::ComputedValues;
 use style::properties::style_structs::Font;
+use style::properties::{
+    ComputedValues, PropertyDeclarationBlock, PropertyId, parse_style_attribute,
+};
 use style::selector_parser::ServoElementSnapshot;
 use style::servo_arc::Arc as ServoArc;
 use style::values::GenericAtomIdent;
@@ -63,8 +65,8 @@ use style::{
     dom::{TDocument, TNode},
     media_queries::MediaList,
     selector_parser::SnapshotMap,
-    shared_lock::{SharedRwLock, StylesheetGuards},
-    stylesheets::{AllowImportRules, DocumentStyleSheet, Origin, Stylesheet},
+    shared_lock::{Locked, SharedRwLock, StylesheetGuards},
+    stylesheets::{AllowImportRules, CssRuleType, DocumentStyleSheet, Origin, Stylesheet},
     stylist::Stylist,
 };
 use style_dom::ElementState;
@@ -1139,15 +1141,32 @@ impl BaseDocument {
     }
 
     pub fn set_style_property(&mut self, node_id: NodeId, name: &str, value: &str) {
+        self.set_style_property_with_importance(node_id, name, value, false);
+    }
+
+    /// [`Self::set_style_property`] with an explicit `!important` flag, for
+    /// `CSSStyleDeclaration.setProperty(name, value, "important")`
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty>).
+    pub fn set_style_property_with_importance(
+        &mut self,
+        node_id: NodeId,
+        name: &str,
+        value: &str,
+        important: bool,
+    ) {
         let quirks = self.quirks_mode();
         let node = &mut self.nodes[node_id];
-        let did_change = node.element_data_mut().unwrap().set_style_property(
-            name,
-            value,
-            &self.guard,
-            self.url.url_extra_data(),
-            quirks,
-        );
+        let did_change = node
+            .element_data_mut()
+            .unwrap()
+            .set_style_property_with_importance(
+                name,
+                value,
+                important,
+                &self.guard,
+                self.url.url_extra_data(),
+                quirks,
+            );
         if did_change {
             node.set_restyle_hint(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
             self.needs_resolve = true;
@@ -1167,6 +1186,93 @@ impl BaseDocument {
             node.set_restyle_hint(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
             self.needs_resolve = true;
         }
+    }
+
+    /// The parsed `style` attribute of `node_id`, which backs the inline
+    /// `CSSStyleDeclaration`. `None` when the element has no `style`
+    /// attribute (<https://drafts.csswg.org/cssom/#css-declaration-blocks>).
+    fn inline_style_block(
+        &self,
+        node_id: NodeId,
+    ) -> Option<&ServoArc<Locked<PropertyDeclarationBlock>>> {
+        self.get_node(node_id)?
+            .element_data()?
+            .style_attribute
+            .as_ref()
+    }
+
+    /// The inline declaration block serialized per CSSOM, or `None` when the
+    /// element has no `style` attribute
+    /// (<https://drafts.csswg.org/cssom/#serialize-a-css-declaration-block>).
+    pub fn inline_style_css_text(&self, node_id: NodeId) -> Option<String> {
+        let block = self.inline_style_block(node_id)?;
+        let guard = self.guard.read();
+        let mut css = String::new();
+        block.read_with(&guard).to_css(&mut css).ok()?;
+        Some(css)
+    }
+
+    /// The declaration names of the inline block in specified order, which is
+    /// what the indexed getter and `length` expose. The style engine already
+    /// expands shorthands into their longhands here, matching CSSOM's
+    /// `declarations` list
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-length>).
+    pub fn inline_style_property_names(&self, node_id: NodeId) -> Option<Vec<String>> {
+        let block = self.inline_style_block(node_id)?;
+        let guard = self.guard.read();
+        Some(
+            block
+                .read_with(&guard)
+                .declarations()
+                .iter()
+                .map(|declaration| declaration.id().name().into_owned())
+                .collect(),
+        )
+    }
+
+    /// The serialized value and `!important` flag of `property` in the inline
+    /// block (`CSSStyleDeclaration.getPropertyValue()` and
+    /// `getPropertyPriority()`). An unset or unknown property serializes to the
+    /// empty string; the flag is reported for a shorthand only when every
+    /// longhand agrees, which `property_priority` already decides
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-getpropertyvalue>).
+    pub fn inline_style_get_property(
+        &self,
+        node_id: NodeId,
+        property: &str,
+    ) -> Option<(String, bool)> {
+        let block = self.inline_style_block(node_id)?;
+        let guard = self.guard.read();
+        let block = block.read_with(&guard);
+        let Ok(property_id) = PropertyId::parse_enabled_for_all_content(property) else {
+            return Some((String::new(), false));
+        };
+        let mut css = String::new();
+        let _ = block.property_value_to_css(&property_id, &mut css);
+        Some((css, block.property_priority(&property_id).important()))
+    }
+
+    /// Replace the inline declarations with those parsed from `css`
+    /// (`CSSStyleDeclaration.cssText` setter). Parsing a declaration list
+    /// never fails; declarations it cannot parse are dropped
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-csstext>,
+    /// <https://drafts.csswg.org/css-syntax/#parse-a-list-of-declarations>).
+    pub fn set_inline_style_css_text(&mut self, node_id: NodeId, css: &str) {
+        let quirks = self.quirks_mode();
+        let url = self.url.url_extra_data();
+        let node = &mut self.nodes[node_id];
+        let Some(element) = node.element_data_mut() else {
+            return;
+        };
+        element.style_attribute = Some(ServoArc::new(self.guard.wrap(parse_style_attribute(
+            css,
+            &url,
+            None,
+            quirks,
+            CssRuleType::Style,
+        ))));
+        node.set_restyle_hint(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
+        self.needs_resolve = true;
     }
 
     pub fn sub_document_node_ids(&self) -> Vec<NodeId> {

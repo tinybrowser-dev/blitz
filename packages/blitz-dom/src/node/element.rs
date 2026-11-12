@@ -1033,6 +1033,28 @@ impl ElementData {
         url_extra_data: UrlExtraData,
         quirks_mode: QuirksMode,
     ) -> bool {
+        self.set_style_property_with_importance(
+            name,
+            value,
+            false,
+            guard,
+            url_extra_data,
+            quirks_mode,
+        )
+    }
+
+    /// [`Self::set_style_property`] with an explicit priority, for the CSSOM
+    /// `setProperty(name, value, "important")` path
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty>).
+    pub fn set_style_property_with_importance(
+        &mut self,
+        name: &str,
+        value: &str,
+        important: bool,
+        guard: &SharedRwLock,
+        url_extra_data: UrlExtraData,
+        quirks_mode: QuirksMode,
+    ) -> bool {
         let mut context = ParserContext::new(
             Origin::Author,
             &url_extra_data,
@@ -1063,9 +1085,14 @@ impl ElementData {
             return false;
         };
 
+        let importance = if important {
+            Importance::Important
+        } else {
+            Importance::Normal
+        };
         self.mutable_style_attribute(guard)
             .write_with(&mut guard.write())
-            .extend(source_property_declaration.drain(), Importance::Normal);
+            .extend(source_property_declaration.drain(), importance);
 
         true
     }
