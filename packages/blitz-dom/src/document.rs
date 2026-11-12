@@ -30,7 +30,10 @@ use cursor_icon::CursorIcon;
 use linebender_resource_handle::Blob;
 use markup5ever::{LocalName, local_name};
 use parley::{FontContext, PlainEditorDriver};
-use selectors::{Element, matching::QuirksMode};
+use selectors::{
+    Element,
+    matching::{ElementSelectorFlags, QuirksMode},
+};
 use smallvec::SmallVec;
 use std::any::Any;
 use std::cell::RefCell;
@@ -89,6 +92,12 @@ pub(crate) fn init_stylo_prefs() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         style_config::set_pref!("layout.css.flexbox-balance.enabled", true);
+        // `:has()`, its relative-argument invalidations, and `:nth-child(An+B of
+        // S)` are behind style-crate prefs that default off in this build
+        // (<https://drafts.csswg.org/selectors-4/#relational>,
+        // <https://drafts.csswg.org/selectors-4/#the-nth-child-pseudo>).
+        style_config::set_pref!("layout.css.has-selector.enabled", true);
+        style_config::set_pref!("layout.css.nth-child-of.enabled", true);
         style_config::set_pref!("layout.css.background-clip.text.enabled", true);
         style_config::set_pref!("layout.css.webkit-text-fill-color.enabled", true);
         style_config::set_pref!("layout.css.columns.enabled", true);
@@ -378,6 +387,10 @@ pub struct BaseDocument {
     pub(crate) last_client_pointer_position: Option<taffy::Point<f32>>,
     /// The node which is currently focussed (if any)
     pub(crate) focus_node_id: Option<NodeId>,
+    /// The element the document URL's fragment names, which `:target` matches.
+    /// Tracked so a later fragment clears the bit from the right element
+    /// (<https://drafts.csswg.org/selectors-4/#the-target-pseudo>).
+    pub(crate) url_target: Option<NodeId>,
     /// The node which is currently active (if any)
     pub(crate) active_node_id: Option<NodeId>,
     /// The node which recieved a mousedown event (if any)
@@ -824,6 +837,7 @@ impl BaseDocument {
             hover_node_is_text: false,
             last_client_pointer_position: None,
             focus_node_id: None,
+            url_target: None,
             active_node_id: None,
             mousedown_node_id: None,
             has_active_animations: false,
@@ -2477,6 +2491,100 @@ impl BaseDocument {
             self.snapshot_node_state_only(node_id);
         }
         cb(&mut self.nodes[node_id]);
+        // `:has()` matches against the subtree below its anchor, so a state
+        // change below an anchor invalidates the rules keyed on it even though
+        // the changed element keeps its own hint.
+        self.restyle_relative_selector_anchors(node_id);
+    }
+
+    /// Restyle every `:has()` anchor above `node_id`. A relative selector
+    /// matches against the whole subtree below its anchor, and this engine's
+    /// restyle hints only flow downwards, so a change anywhere below the anchor
+    /// must hint the anchor's subtree itself. The anchor carries
+    /// `ANCHORS_RELATIVE_SELECTOR` when `:has()` is the rule's subject and
+    /// `ANCHORS_RELATIVE_SELECTOR_NON_SUBJECT` when it is not
+    /// (<https://drafts.csswg.org/selectors/#relational>). Servo stores the
+    /// finer-grained invalidation maps this engine does not have, so the hinted
+    /// subtree is the correctness fallback rather than the fast path.
+    pub(crate) fn restyle_relative_selector_anchors(&mut self, node_id: NodeId) {
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            let node = &mut self.nodes[id];
+            current = node.parent;
+            // Selector flags live on element, anonymous-block, and document
+            // nodes; the document takes the flags its root element's selectors
+            // deposit (`apply_selector_flags`'s `for_parent()` half). A shadow
+            // root or a fragment has none.
+            if !matches!(
+                node.data,
+                NodeData::Element(_) | NodeData::AnonymousBlock(_) | NodeData::Document(_)
+            ) {
+                continue;
+            }
+            if node.selector_flags().get().intersects(
+                ElementSelectorFlags::ANCHORS_RELATIVE_SELECTOR
+                    | ElementSelectorFlags::ANCHORS_RELATIVE_SELECTOR_NON_SUBJECT,
+            ) {
+                node.set_restyle_hint(RestyleHint::restyle_subtree());
+            }
+        }
+    }
+
+    /// Applies HTML's "update the target element" for `fragment`, already
+    /// percent-decoded: the first element in tree order whose ID is the
+    /// fragment, or failing that the first `a` whose `name` is. The previously
+    /// targeted element loses [`ElementState::URLTARGET`] in the same pass, and
+    /// each element is snapshotted first so the cascade invalidates exactly the
+    /// rules that read it
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid>,
+    /// <https://drafts.csswg.org/selectors-4/#the-target-pseudo>).
+    pub fn set_url_target(&mut self, fragment: Option<&str>) {
+        if let Some(previous) = self.url_target.take() {
+            self.snapshot_node_and(previous, ElementState::URLTARGET, |node| {
+                if let Some(element) = node.element_data_mut() {
+                    element.element_state.remove(ElementState::URLTARGET);
+                }
+                node.mark_ancestors_dirty();
+            });
+            self.needs_resolve = true;
+        }
+        let Some(fragment) = fragment.filter(|fragment| !fragment.is_empty()) else {
+            return;
+        };
+        let Some(target) = self.find_url_target(fragment) else {
+            return;
+        };
+        self.snapshot_node_and(target, ElementState::URLTARGET, |node| {
+            if let Some(element) = node.element_data_mut() {
+                element.element_state.insert(ElementState::URLTARGET);
+            }
+            node.mark_ancestors_dirty();
+        });
+        self.url_target = Some(target);
+        self.needs_resolve = true;
+    }
+
+    /// The element a fragment names: its ID first, then an `a` element whose
+    /// `name` matches, both in tree order
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-fragid>).
+    fn find_url_target(&self, fragment: &str) -> Option<NodeId> {
+        if let Some(id) = self.get_element_by_id(fragment) {
+            return Some(id);
+        }
+        let mut stack = vec![self.root_node_id];
+        while let Some(current) = stack.pop() {
+            let node = self.get_node(current)?;
+            if let Some(element) = node.element_data()
+                && element.name.local.as_str() == "a"
+                && element
+                    .attr(local_name!("name"))
+                    .is_some_and(|name| name == fragment)
+            {
+                return Some(current);
+            }
+            stack.extend(node.children.iter().rev().copied());
+        }
+        None
     }
 
     // Takes (x, y) co-ordinates (relative to the )

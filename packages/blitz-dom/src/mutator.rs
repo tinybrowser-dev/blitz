@@ -1101,6 +1101,7 @@ impl DocumentMutator<'_> {
         }
         // Mark ancestors dirty so the style traversal visits this subtree.
         node.mark_ancestors_dirty();
+        self.doc.restyle_relative_selector_anchors(node_id);
     }
 
     /// Restyle an in-document element whose child list changed, `changed` being the position
@@ -1108,14 +1109,16 @@ impl DocumentMutator<'_> {
     /// children are styled by the traversal regardless; the element and its other children
     /// only need restyling where its selector flags record a selector that depends on them.
     fn restyle_for_child_list_change(&mut self, parent_id: NodeId, changed: Range<usize>) {
-        let parent = &self.doc.nodes[parent_id];
-        let flags = match &parent.data {
-            NodeData::Element(_) | NodeData::AnonymousBlock(_) | NodeData::Document(_) => {
-                parent.selector_flags().get()
+        let flags = {
+            let parent = &self.doc.nodes[parent_id];
+            match &parent.data {
+                NodeData::Element(_) | NodeData::AnonymousBlock(_) | NodeData::Document(_) => {
+                    parent.selector_flags().get()
+                }
+                // A shadow root or a fragment has no selector flags: no selector
+                // can make it a subject, so only the dirty marking below matters.
+                _ => ElementSelectorFlags::empty(),
             }
-            // A shadow root or a fragment has no selector flags: no selector
-            // can make it a subject, so only the dirty marking below matters.
-            _ => ElementSelectorFlags::empty(),
         };
         let mut hint = RestyleHint::empty();
         if flags.intersects(
@@ -1125,10 +1128,11 @@ impl DocumentMutator<'_> {
         ) {
             hint |= RestyleHint::RESTYLE_SELF;
         }
+        self.doc.restyle_relative_selector_anchors(parent_id);
         // A change with no earlier element sibling restyles all children with one hint rather
         // than hinting each later sibling, so inserting or removing at the front stays linear.
         let front_change = flags.contains(ElementSelectorFlags::HAS_SLOW_SELECTOR_LATER_SIBLINGS)
-            && !parent.children[..changed.start]
+            && !self.doc.nodes[parent_id].children[..changed.start]
                 .iter()
                 .any(|id| self.doc.nodes[*id].is_element());
         if front_change

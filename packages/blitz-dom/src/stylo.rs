@@ -549,7 +549,10 @@ impl selectors::Element for BlitzNode<'_> {
             NonTSPseudoClass::ReadWrite => false,
             NonTSPseudoClass::ReadOnly => false,
             NonTSPseudoClass::ServoNonZeroBorder => false,
-            NonTSPseudoClass::Target => false,
+            // The document sets the bit on the element its URL fragment names
+            // (`BaseDocument::set_url_target`)
+            // <https://drafts.csswg.org/selectors-4/#the-target-pseudo>
+            NonTSPseudoClass::Target => self.element_state().contains(ElementState::URLTARGET),
             NonTSPseudoClass::Visited => false,
             NonTSPseudoClass::Autofill => false,
             NonTSPseudoClass::Default => false,
