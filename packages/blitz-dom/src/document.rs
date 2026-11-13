@@ -3399,9 +3399,10 @@ impl BaseDocument {
     /// (or to the initial containing block when the `offsetParent` is a non-positioned
     /// `body`, or there is none).
     ///
-    /// Nodes with their own layout box use that box directly. Non-atomic inline elements
-    /// have no layout box: they use the bounding box of their per-line-box fragments, and
-    /// their `offsetParent` is resolved from the containing inline root.
+    /// Nodes with their own layout box use that box directly. A non-atomic inline element
+    /// has no layout box: its origin is the first fragment's and its size is the union of
+    /// the per-line-box fragments', which matches Blink (probed with a multi-line inline),
+    /// and its `offsetParent` is resolved from the containing inline root.
     pub fn offset_rect(&self, node_id: NodeId) -> Option<BoundingRect> {
         let node = self.get_node(node_id)?;
 
@@ -3424,13 +3425,17 @@ impl BaseDocument {
             });
         };
 
-        // Union the per-line-box fragments into a single bounding box
-        let bounds = rects.reduce(BoundingRect::union)?;
+        // CSSOM View's offsetLeft/offsetTop use the first box associated with
+        // the element, while offsetWidth/offsetHeight cover all of them
+        // (<https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsettop>).
+        let mut rects = rects;
+        let first = rects.next()?;
+        let bounds = rects.fold(first, BoundingRect::union);
 
         // Fragment rects are viewport-relative; convert to document-relative
         let scroll = self.viewport_scroll();
-        let mut x = bounds.x + scroll.x;
-        let mut y = bounds.y + scroll.y;
+        let mut x = first.x + scroll.x;
+        let mut y = first.y + scroll.y;
 
         // Resolve the offsetParent from the inline root (the root itself if it is positioned)
         let inline_root = node.inline_root_ancestor()?;
