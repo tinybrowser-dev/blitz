@@ -3,6 +3,9 @@
 
 use blitz_traits::events::{BlitzScrollEvent, DomEvent, DomEventData};
 use blitz_traits::node_id::NodeId;
+use markup5ever::local_name;
+use style::logical_geometry::{PhysicalSide, WritingMode};
+use style::properties::generated::longhands::position::computed_value::T as Position;
 use style::values::computed::Overflow;
 use stylo_taffy::CopyStyleGetters;
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +29,16 @@ pub enum ScrollLogicalPosition {
     Nearest,
 }
 
+/// How far up the containing block chain a `scrollIntoView` call scrolls
+/// (<https://drafts.csswg.org/cssom-view/#dom-scrollintoviewoptions-container>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollIntoViewContainer {
+    /// Scroll every ancestor scrolling box, then the viewport.
+    All,
+    /// Stop after the nearest ancestor scrolling box, if there is one.
+    Nearest,
+}
+
 /// What a scroll applies to.
 ///
 /// Per the CSS overflow propagation rules the root element has no scrolling mechanism of its
@@ -35,6 +48,91 @@ pub enum ScrollLogicalPosition {
 pub(crate) enum ScrollTarget {
     Node(NodeId),
     Viewport,
+}
+
+/// Whether an axis with this computed overflow has a scrolling box.
+///
+/// `visible` and `clip` have none; `hidden` does for programmatic scrolls
+/// (<https://drafts.csswg.org/cssom-view/#scrolling-box>).
+fn scrollable_overflow(overflow: Overflow) -> bool {
+    !matches!(overflow, Overflow::Visible | Overflow::Clip)
+}
+
+/// Whether a node establishes a scrolling box of its own. The root element's
+/// overflow belongs to the viewport, so the caller handles it separately.
+fn establishes_scrolling_box(node: &crate::Node) -> bool {
+    if !node.has_boxes() || node.is_non_atomic_inline() {
+        return false;
+    }
+    let Some(styles) = node.primary_styles() else {
+        return false;
+    };
+    scrollable_overflow(styles.clone_overflow_x()) || scrollable_overflow(styles.clone_overflow_y())
+}
+
+/// Whether `node` is fixed to the viewport, so scrolling the viewport does not
+/// move it
+/// (<https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview>).
+///
+/// Blitz hoists a `position: fixed` box to its fixed-position containing block,
+/// which is the root element when no ancestor establishes one, so a fixed box
+/// whose containing block is the root is viewport-fixed.
+fn fixed_to_viewport(node: &crate::Node, root: Option<NodeId>) -> bool {
+    let Some(root) = root else {
+        return false;
+    };
+    node.primary_styles()
+        .is_some_and(|styles| styles.clone_position() == Position::Fixed)
+        && node
+            .containing_block()
+            .is_none_or(|containing_block| containing_block == root)
+}
+
+/// One logical axis of a writing mode mapped into physical coordinates.
+///
+/// `reversed` means the logical start is the physical max side (right for
+/// `vertical-rl`/`sideways-rl` and RTL inline axes, bottom for a reversed
+/// inline axis of a vertical mode), so "start" alignment moves the physical
+/// end edges.
+#[derive(Clone, Copy)]
+struct LogicalAxis {
+    horizontal: bool,
+    reversed: bool,
+}
+
+impl LogicalAxis {
+    fn block(writing_mode: WritingMode) -> Self {
+        Self {
+            horizontal: writing_mode.is_vertical(),
+            reversed: matches!(
+                writing_mode.block_start_physical_side(),
+                PhysicalSide::Right | PhysicalSide::Bottom
+            ),
+        }
+    }
+
+    fn inline(writing_mode: WritingMode) -> Self {
+        Self {
+            horizontal: !writing_mode.is_vertical(),
+            reversed: matches!(
+                writing_mode.inline_start_physical_side(),
+                PhysicalSide::Right | PhysicalSide::Bottom
+            ),
+        }
+    }
+
+    /// The physical alignment this logical position means on the axis
+    /// (<https://drafts.csswg.org/cssom-view/#determine-the-scroll-into-view-position>).
+    fn position(self, position: ScrollLogicalPosition) -> ScrollLogicalPosition {
+        if !self.reversed {
+            return position;
+        }
+        match position {
+            ScrollLogicalPosition::Start => ScrollLogicalPosition::End,
+            ScrollLogicalPosition::End => ScrollLogicalPosition::Start,
+            ScrollLogicalPosition::Center | ScrollLogicalPosition::Nearest => position,
+        }
+    }
 }
 
 /// How far to scroll.
@@ -615,41 +713,219 @@ impl BaseDocument {
         }
     }
 
-    /// Scroll the viewport so that the given element has the requested alignment in each axis.
+    /// Whether `id`'s `overflow` is applied to the viewport instead of to a
+    /// scrolling box of its own
+    /// (<https://drafts.csswg.org/css-overflow-3/#overflow-propagation>).
+    ///
+    /// The root element's overflow always belongs to the viewport. When the root
+    /// is an HTML `html` element whose own overflow is `visible` on both axes,
+    /// the first `body` child's overflow propagates instead, and that `body` has
+    /// no scrolling box. Blitz applies neither value to the viewport scroll
+    /// range yet (`docs/upstream.md`), but a scroll walk and the CSSOM View
+    /// used-overflow questions both need the boxes the propagation removes.
+    pub fn overflow_propagates_to_viewport(&self, id: NodeId) -> bool {
+        let Some(root) = self.try_root_element() else {
+            return false;
+        };
+        if id == root.id {
+            return true;
+        }
+        let Some(node) = self.nodes.get(id) else {
+            return false;
+        };
+        if node.parent != Some(root.id) || !node.data.is_element_with_tag_name(&local_name!("body"))
+        {
+            return false;
+        }
+        root.primary_styles().is_some_and(|styles| {
+            styles.clone_overflow_x() == Overflow::Visible
+                && styles.clone_overflow_y() == Overflow::Visible
+        })
+    }
+
+    /// Scroll the element into view with the requested alignment in each axis
+    /// (<https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview>,
+    /// <https://drafts.csswg.org/cssom-view/#scroll-a-target-into-view>).
+    ///
+    /// Every ancestor that establishes a scrolling box is scrolled from
+    /// innermost to outermost, then the viewport, so a target inside a nested
+    /// scroller moves that scroller and not just the page. `block`/`inline`
+    /// are logical, so each box's writing mode decides which physical axis and
+    /// which edge each one names. `container` caps the walk at the nearest
+    /// ancestor scrolling box.
     pub fn scroll_into_view(
         &mut self,
         node_id: NodeId,
         behavior: ScrollBehavior,
-        vertical: ScrollLogicalPosition,
-        horizontal: ScrollLogicalPosition,
+        block: ScrollLogicalPosition,
+        inline: ScrollLogicalPosition,
+        container: ScrollIntoViewContainer,
     ) {
-        let Some(node) = self.nodes.get(node_id) else {
+        let Some(target) = self.nodes.get(node_id) else {
             return;
         };
-        let target =
-            node.absolute_position(node.scroll_offset().x as f32, node.scroll_offset().y as f32);
-        let target_size = node.final_layout().size;
-        let Some(root_id) = self.try_root_element().map(|root| root.id) else {
+        if !target.has_boxes() {
+            return;
+        }
+        let root = self.try_root_element().map(|root| root.id);
+        // Only the scrolling boxes in the target's containing block chain can
+        // move it: an absolutely positioned ancestor's containing block is the
+        // initial containing block, so a scroller the target is laid out
+        // outside of must not scroll (`scrollintoview-containingblock-chain.html`).
+        let mut containers = Vec::new();
+        // A viewport-fixed box does not move when the viewport scrolls, so the
+        // chain ends at it: its own scroller may move its content, but the
+        // viewport must not scroll (`scrollIntoView-fixed.html`).
+        let mut chain_fixed_to_viewport = self
+            .nodes
+            .get(node_id)
+            .is_some_and(|node| fixed_to_viewport(node, root));
+        let mut current = node_id;
+        while let Some(id) = self
+            .nodes
+            .get(current)
+            .and_then(crate::Node::containing_block)
+        {
+            let Some(node) = self.nodes.get(id) else {
+                break;
+            };
+            if establishes_scrolling_box(node) && !self.overflow_propagates_to_viewport(id) {
+                containers.push(id);
+            }
+            if fixed_to_viewport(node, root) {
+                chain_fixed_to_viewport = true;
+                break;
+            }
+            current = id;
+        }
+        // The walk found them innermost first; `container: "nearest"` stops
+        // after the first.
+        let nearest = container == ScrollIntoViewContainer::Nearest;
+        let scrolled_containers = !containers.is_empty();
+        if nearest {
+            containers.truncate(1);
+        }
+        for container in containers {
+            self.scroll_target_in_container(node_id, container, behavior, block, inline);
+        }
+        // `container: "nearest"` aborts after the nearest scrolling box, so the
+        // viewport only scrolls when the target has no ancestor scroller.
+        if (!nearest || !scrolled_containers) && !chain_fixed_to_viewport {
+            self.scroll_target_in_viewport(node_id, behavior, block, inline, root);
+        }
+    }
+
+    /// Scroll one ancestor's scrolling box so `target_id` has the requested
+    /// logical alignment. Positions are content coordinates: measured from the
+    /// box's padding-box origin with its current scroll offset removed, which
+    /// is what `aligned_scroll_offset` expects.
+    fn scroll_target_in_container(
+        &mut self,
+        target_id: NodeId,
+        container_id: NodeId,
+        behavior: ScrollBehavior,
+        block: ScrollLogicalPosition,
+        inline: ScrollLogicalPosition,
+    ) {
+        let Some(target) = self.nodes.get(target_id) else {
             return;
         };
+        let target_position = target.absolute_position(
+            target.scroll_offset().x as f32,
+            target.scroll_offset().y as f32,
+        );
+        let target_size = target.final_layout().size;
+        let Some(container) = self.nodes.get(container_id) else {
+            return;
+        };
+        let container_position = container.absolute_position(0.0, 0.0);
+        let border = container.final_layout().border;
+        let scroll = *container.scroll_offset();
+        let client_width = container.client_width() as f64;
+        let client_height = container.client_height() as f64;
+        let writing_mode = container.writing_mode();
+        let (x, y) = Self::aligned_offsets(
+            (scroll.x, scroll.y),
+            (client_width, client_height),
+            (
+                target_position.x as f64 - (container_position.x + border.left) as f64,
+                target_position.y as f64 - (container_position.y + border.top) as f64,
+            ),
+            (target_size.width as f64, target_size.height as f64),
+            LogicalAxis::block(writing_mode),
+            LogicalAxis::inline(writing_mode),
+            block,
+            inline,
+        );
+        self.scroll_to(container_id, x, y, behavior);
+    }
+
+    /// Scroll the viewport so `target_id` has the requested logical alignment.
+    fn scroll_target_in_viewport(
+        &mut self,
+        target_id: NodeId,
+        behavior: ScrollBehavior,
+        block: ScrollLogicalPosition,
+        inline: ScrollLogicalPosition,
+        root: Option<NodeId>,
+    ) {
+        let Some(root) = root else {
+            return;
+        };
+        let Some(target) = self.nodes.get(target_id) else {
+            return;
+        };
+        let target_position = target.absolute_position(
+            target.scroll_offset().x as f32,
+            target.scroll_offset().y as f32,
+        );
+        let target_size = target.final_layout().size;
+        let writing_mode = self
+            .nodes
+            .get(root)
+            .map_or_else(WritingMode::empty, crate::Node::writing_mode);
         let scale = self.viewport.scale() as f64;
         let viewport_width = self.viewport.window_size.0 as f64 / scale;
         let viewport_height = self.viewport.window_size.1 as f64 / scale;
-        let x = Self::aligned_scroll_offset(
-            self.viewport_scroll().x,
-            viewport_width,
-            target.x as f64,
-            target_size.width as f64,
-            horizontal,
+        let scroll = self.viewport_scroll();
+        let (x, y) = Self::aligned_offsets(
+            (scroll.x, scroll.y),
+            (viewport_width, viewport_height),
+            (target_position.x as f64, target_position.y as f64),
+            (target_size.width as f64, target_size.height as f64),
+            LogicalAxis::block(writing_mode),
+            LogicalAxis::inline(writing_mode),
+            block,
+            inline,
         );
-        let y = Self::aligned_scroll_offset(
-            self.viewport_scroll().y,
-            viewport_height,
-            target.y as f64,
-            target_size.height as f64,
-            vertical,
-        );
-        self.scroll_to(root_id, x, y, behavior);
+        self.scroll_to(root, x, y, behavior);
+    }
+
+    /// Align a target on each physical axis from the logical block and inline
+    /// positions of the box's writing mode.
+    fn aligned_offsets(
+        current: (f64, f64),
+        viewport: (f64, f64),
+        target: (f64, f64),
+        target_size: (f64, f64),
+        block_axis: LogicalAxis,
+        inline_axis: LogicalAxis,
+        block: ScrollLogicalPosition,
+        inline: ScrollLogicalPosition,
+    ) -> (f64, f64) {
+        let block = block_axis.position(block);
+        let inline = inline_axis.position(inline);
+        if block_axis.horizontal {
+            (
+                Self::aligned_scroll_offset(current.0, viewport.0, target.0, target_size.0, block),
+                Self::aligned_scroll_offset(current.1, viewport.1, target.1, target_size.1, inline),
+            )
+        } else {
+            (
+                Self::aligned_scroll_offset(current.0, viewport.0, target.0, target_size.0, inline),
+                Self::aligned_scroll_offset(current.1, viewport.1, target.1, target_size.1, block),
+            )
+        }
     }
 
     /// Resolve a URL fragment (the `#...` part of a URL) to a scroll target.
@@ -691,6 +967,7 @@ impl BaseDocument {
                     behavior,
                     ScrollLogicalPosition::Start,
                     ScrollLogicalPosition::Nearest,
+                    ScrollIntoViewContainer::All,
                 );
                 true
             }

@@ -116,7 +116,7 @@ pub use node::{
     Attribute, Dirtiness, DocumentData, ElementData, FormControlState, Node, NodeData, TextNodeData,
 };
 pub use parley::FontContext;
-pub use scrolling::{ScrollBehavior, ScrollLogicalPosition};
+pub use scrolling::{ScrollBehavior, ScrollIntoViewContainer, ScrollLogicalPosition};
 pub use selectors::matching::QuirksMode as StyleQuirksMode;
 pub use tree::NodeTree;
 
