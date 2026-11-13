@@ -504,6 +504,7 @@ impl DocumentMutator<'_> {
 
     pub fn set_attribute(&mut self, node_id: NodeId, name: QualName, value: &str) {
         let quirks = self.doc.quirks_mode();
+        let no_namespace = name.ns == markup5ever::ns!();
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
             self.doc.snapshot_node(node_id, &name.local);
@@ -511,7 +512,7 @@ impl DocumentMutator<'_> {
             self.restyle_for_attribute_change(node_id, &name.local);
         }
 
-        if name.local == local_name!("id") && node_is_in_document {
+        if no_namespace && name.local == local_name!("id") && node_is_in_document {
             if let Some(old_id) = self.doc.nodes[node_id]
                 .element_data()
                 .map(|element| element.id.clone())
@@ -523,13 +524,14 @@ impl DocumentMutator<'_> {
             }
         }
 
-        let refresh_placeholder = matches!(
-            name.local,
-            ref local
-                if local == &local_name!("value")
-                    || local == &local_name!("placeholder")
-                    || local == &local_name!("type")
-        );
+        let refresh_placeholder = no_namespace
+            && matches!(
+                name.local,
+                ref local
+                    if local == &local_name!("value")
+                        || local == &local_name!("placeholder")
+                        || local == &local_name!("type")
+            );
         let textarea_text_empty = refresh_placeholder
             && self.doc.nodes[node_id]
                 .element_data()
@@ -545,7 +547,9 @@ impl DocumentMutator<'_> {
         self.mutations_occurred |= node_is_in_document;
         // If element is a CustomWidget, then Ccall attribute_changed on it
         #[cfg(feature = "custom-widget")]
-        if let SpecialElementData::CustomWidget(widget_data) = &mut element.special_data {
+        if no_namespace
+            && let SpecialElementData::CustomWidget(widget_data) = &mut element.special_data
+        {
             let old_value = element.attrs.get(&name).as_ref().map(|attr| &*attr.value);
             widget_data
                 .widget
@@ -553,7 +557,7 @@ impl DocumentMutator<'_> {
         }
 
         element.attrs.set(name.clone(), value);
-        if refresh_placeholder && name.local != local_name!("value") {
+        if no_namespace && refresh_placeholder && name.local != local_name!("value") {
             element.sync_placeholder_shown(textarea_text_empty);
         }
 
@@ -565,6 +569,15 @@ impl DocumentMutator<'_> {
                     name: blitz_traits::SmolStr::new(&*name.local),
                 })
             );
+        }
+
+        // A namespaced attribute is stored under its own name but never
+        // triggers the HTML behavior of the no-namespace attribute with the
+        // same local name: a namespaced `style` is not the inline style, a
+        // namespaced `href` is not a link, and so on
+        // (<https://dom.spec.whatwg.org/#concept-attribute-list>).
+        if !no_namespace {
+            return;
         }
 
         // Focusability is cached on the element and comes from these
@@ -715,6 +728,7 @@ impl DocumentMutator<'_> {
 
     pub fn clear_attribute(&mut self, node_id: NodeId, name: QualName) {
         let quirks = self.doc.quirks_mode();
+        let no_namespace = name.ns == markup5ever::ns!();
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
             self.doc.snapshot_node(node_id, &name.local);
@@ -722,7 +736,7 @@ impl DocumentMutator<'_> {
             self.restyle_for_attribute_change(node_id, &name.local);
         }
 
-        if name.local == local_name!("id") && node_is_in_document {
+        if no_namespace && name.local == local_name!("id") && node_is_in_document {
             if let Some(old_id) = self.doc.nodes[node_id]
                 .element_data()
                 .and_then(|element| element.id.clone())
@@ -731,13 +745,14 @@ impl DocumentMutator<'_> {
             }
         }
 
-        let refresh_placeholder = matches!(
-            name.local,
-            ref local
-                if local == &local_name!("value")
-                    || local == &local_name!("placeholder")
-                    || local == &local_name!("type")
-        );
+        let refresh_placeholder = no_namespace
+            && matches!(
+                name.local,
+                ref local
+                    if local == &local_name!("value")
+                        || local == &local_name!("placeholder")
+                        || local == &local_name!("type")
+            );
         let textarea_text_empty = refresh_placeholder
             && self.doc.nodes[node_id]
                 .element_data()
@@ -768,11 +783,21 @@ impl DocumentMutator<'_> {
 
         // If element is a CustomWidget, then call attribute_changed on it
         #[cfg(feature = "custom-widget")]
-        if let SpecialElementData::CustomWidget(widget_data) = &mut element.special_data {
+        if no_namespace
+            && let SpecialElementData::CustomWidget(widget_data) = &mut element.special_data
+        {
             let old_value = removed_attr.as_ref().map(|attr| &*attr.value);
             widget_data
                 .widget
                 .attribute_changed(&name.local, old_value, None);
+        }
+
+        // Removing a namespaced attribute never undoes the HTML behavior of
+        // the no-namespace attribute with the same local name, which is still
+        // present (or absent) under its own name
+        // (<https://dom.spec.whatwg.org/#concept-attribute-list>).
+        if !no_namespace {
+            return;
         }
 
         if name.local == local_name!("id") {

@@ -625,7 +625,14 @@ impl ElementData {
     }
 
     pub fn attr(&self, name: impl PartialEq<LocalName>) -> Option<&str> {
-        let attr = self.attrs.iter().find(|attr| name == attr.name.local)?;
+        // An attribute with a local name is the no-namespace attribute: a
+        // namespaced attribute (such as `xlink:href`) is a different attribute
+        // and never stands in for it
+        // (<https://dom.spec.whatwg.org/#concept-attribute-list>).
+        let attr = self
+            .attrs
+            .iter()
+            .find(|attr| attr.name.ns == markup5ever::ns!() && name == attr.name.local)?;
         Some(&attr.value)
     }
 
@@ -654,7 +661,9 @@ impl ElementData {
 
     /// Detects the presence of the attribute, treating *any* value as truthy.
     pub fn has_attr(&self, name: impl PartialEq<LocalName>) -> bool {
-        self.attrs.iter().any(|attr| name == attr.name.local)
+        self.attrs
+            .iter()
+            .any(|attr| attr.name.ns == markup5ever::ns!() && name == attr.name.local)
     }
 
     pub fn can_be_disabled(&self) -> bool {
