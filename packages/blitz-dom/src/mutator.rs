@@ -317,6 +317,10 @@ impl DocumentMutator<'_> {
 
     pub fn create_element(&mut self, name: QualName, attrs: Vec<Attribute>) -> NodeId {
         let mut data = ElementData::new(name, attrs);
+        // Selector matching reads the document's mode for attribute-name case
+        // sensitivity, and a detached element cannot walk to its document
+        // (<https://drafts.csswg.org/selectors-4/#attribute-case>).
+        data.in_html_document = self.doc.is_html_document();
         data.flush_style_attribute(
             self.doc.guard(),
             &self.doc.url.url_extra_data(),

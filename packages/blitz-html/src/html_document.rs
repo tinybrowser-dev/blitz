@@ -48,7 +48,15 @@ impl HtmlDocument {
 
     /// Parse XML (XHTML) into an [`HtmlDocument`]
     pub fn from_xml(xml: &str, config: DocumentConfig) -> Self {
-        Self::parse_with(xml, config, DocumentHtmlParser::parse_xml_into_mutator)
+        let mut doc = BaseDocument::new(config);
+        // XML documents match attribute names case-sensitively, and every
+        // element created while parsing inherits the mode
+        // (<https://drafts.csswg.org/selectors-4/#attribute-case>).
+        doc.set_is_html_document(false);
+        let mut mutr = doc.mutate();
+        DocumentHtmlParser::parse_xml_into_mutator(&mut mutr, xml);
+        drop(mutr);
+        HtmlDocument { inner: doc }
     }
 
     fn parse_with(

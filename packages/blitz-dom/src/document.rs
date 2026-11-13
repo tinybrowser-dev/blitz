@@ -1371,6 +1371,25 @@ impl BaseDocument {
         &mut self.nodes[self.root_node_id]
     }
 
+    /// Whether this tree is an HTML document, which decides attribute-name
+    /// case sensitivity in selectors
+    /// (<https://drafts.csswg.org/selectors-4/#attribute-case>).
+    pub fn is_html_document(&self) -> bool {
+        match &self.root_node().data {
+            crate::node::NodeData::Document(document) => document.is_html_document,
+            _ => true,
+        }
+    }
+
+    /// Records that XML parsing built this tree, so attribute names in
+    /// selectors match case-sensitively
+    /// (<https://drafts.csswg.org/selectors-4/#attribute-case>).
+    pub fn set_is_html_document(&mut self, is_html: bool) {
+        if let crate::node::NodeData::Document(document) = &mut self.root_node_mut().data {
+            document.is_html_document = is_html;
+        }
+    }
+
     pub fn try_root_element(&self) -> Option<&Node> {
         TDocument::as_node(&self.root_node()).first_element_child()
     }

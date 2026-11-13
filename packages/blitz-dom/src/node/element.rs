@@ -65,6 +65,13 @@ pub struct ElementData {
     /// Whether the element is focussable
     pub is_focussable: bool,
 
+    /// Whether this element's node document is an HTML document. XML
+    /// documents (including XHTML) match attribute names case-sensitively, so
+    /// selector matching needs the document's mode, which a detached element
+    /// cannot recover from its parent chain
+    /// (<https://drafts.csswg.org/selectors-4/#attribute-case>).
+    pub in_html_document: bool,
+
     /// The element's parsed style attribute (used by stylo)
     pub style_attribute: Option<ServoArc<Locked<PropertyDeclarationBlock>>>,
 
@@ -333,6 +340,11 @@ pub struct DocumentData {
     pub has_snapshot: bool,
     pub snapshot_handled: AtomicBool,
     pub display_constructed_as: StyloDisplay,
+    /// Whether this is an HTML document. XML documents (including XHTML) match
+    /// attribute names case-sensitively, so the selector matcher needs to know
+    /// which parser built the tree
+    /// (<https://drafts.csswg.org/selectors-4/#attribute-case>).
+    pub is_html_document: bool,
     /// Layout output state (`None` until layout first writes to this node).
     pub layout_data: Option<Box<LayoutData>>,
     pub transform: Option<Box<Affine>>,
@@ -369,6 +381,7 @@ impl DocumentData {
             has_snapshot: false,
             snapshot_handled: AtomicBool::new(false),
             display_constructed_as: StyloDisplay::Block,
+            is_html_document: true,
             layout_data: None,
             transform: None,
         }
@@ -426,6 +439,7 @@ impl Clone for ElementData {
             classes: self.classes.clone(),
             attrs: self.attrs.clone(),
             is_focussable: self.is_focussable,
+            in_html_document: self.in_html_document,
             style_attribute: self.style_attribute.clone(),
             special_data: self.special_data.clone(),
             background_images: self.background_images.clone(),
@@ -549,6 +563,7 @@ impl ElementData {
             classes,
             attrs: Attributes::new(attrs),
             is_focussable: false,
+            in_html_document: true,
             style_attribute: Default::default(),
             inline_layout_data: None,
             list_item_data: None,

@@ -474,7 +474,15 @@ impl selectors::Element for BlitzNode<'_> {
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
-        true // self.has_namespace(ns!(html))
+        // Attribute-name case sensitivity depends on both the element's
+        // namespace and the document's mode: an XHTML document's elements are
+        // in the HTML namespace, but their attribute names stay case-sensitive.
+        // The mode is stamped on each element so a detached element still
+        // knows it
+        // (<https://drafts.csswg.org/selectors-4/#attribute-case>).
+        self.element_data().is_some_and(|element| {
+            element.name.ns == ns!(html) && element.in_html_document
+        })
     }
 
     fn has_local_name(&self, local_name: &LocalName) -> bool {
@@ -536,7 +544,9 @@ impl selectors::Element for BlitzNode<'_> {
             NonTSPseudoClass::Indeterminate => {
                 self.element_state().contains(ElementState::INDETERMINATE)
             }
-            NonTSPseudoClass::Lang(_) => false,
+            // The element's language comes from the nearest `lang`/`xml:lang`
+            // ancestor (<https://drafts.csswg.org/selectors-4/#the-lang-pseudo>).
+            NonTSPseudoClass::Lang(ref lang) => self.match_element_lang(None, lang),
             NonTSPseudoClass::CustomState(_) => false,
             NonTSPseudoClass::Link => self.element_state().contains(ElementState::UNVISITED),
             // The bit is maintained by `ElementData::sync_placeholder_shown`.
@@ -655,13 +665,24 @@ impl selectors::Element for BlitzNode<'_> {
     }
 
     fn is_empty(&self) -> bool {
-        self.dom_children().next().is_none()
+        // Comments, processing instructions, and other non-content nodes do
+        // not affect emptiness; only elements and content nodes with data of a
+        // non-zero length do
+        // (<https://drafts.csswg.org/selectors-4/#the-empty-pseudo>).
+        self.dom_children().all(|child| match &child.data {
+            NodeData::Element(_) | NodeData::AnonymousBlock(_) => false,
+            NodeData::Text(text) => text.content.is_empty(),
+            NodeData::CDataSection { contents } => contents.is_empty(),
+            _ => true,
+        })
     }
 
     fn is_root(&self) -> bool {
+        // `:root` matches the document element only: the top of a detached
+        // tree or a shadow tree is not the root of a document
+        // (<https://drafts.csswg.org/selectors-4/#the-root-pseudo>).
         self.parent_node()
-            .and_then(|parent| parent.parent_node())
-            .is_none()
+            .is_some_and(|parent| matches!(parent.data, NodeData::Document(_)))
     }
 
     fn has_custom_state(
@@ -675,6 +696,35 @@ impl selectors::Element for BlitzNode<'_> {
         each_relevant_element_hash(*self, |hash| filter.insert_hash(hash & BLOOM_HASH_MASK));
         true
     }
+}
+
+/// The language of `element`, inherited from the nearest ancestor with a
+/// `lang` or `xml:lang` attribute. An inherited empty value means the language
+/// is unknown
+/// (<https://drafts.csswg.org/selectors-4/#the-lang-pseudo>).
+fn inherited_lang(element: &BlitzNode<'_>) -> Option<style::selector_parser::AttrValue> {
+    let mut current = Some(*element);
+    while let Some(node) = current {
+        if let Some(lang) = node.lang_attr() {
+            return Some(lang);
+        }
+        current = TNode::parent_element(&node);
+    }
+    None
+}
+
+/// Whether `tag` matches the language range `range`: a case-insensitive exact
+/// match, a prefix that ends on a subtag boundary, or the `*` wildcard
+/// (<https://drafts.csswg.org/selectors-4/#the-lang-pseudo>).
+fn language_tag_matches(tag: &str, range: &str) -> bool {
+    if range == "*" {
+        return !tag.is_empty();
+    }
+    tag.eq_ignore_ascii_case(range)
+        || (tag.len() > range.len()
+            && tag.is_char_boundary(range.len())
+            && tag.as_bytes().get(range.len()) == Some(&b'-')
+            && tag[..range.len()].eq_ignore_ascii_case(range))
 }
 
 impl<'a> TElement for BlitzNode<'a> {
@@ -928,15 +978,35 @@ impl<'a> TElement for BlitzNode<'a> {
     }
 
     fn lang_attr(&self) -> Option<style::selector_parser::AttrValue> {
-        None
+        // `xml:lang` wins over `lang`, and in HTML the `lang` attribute is in
+        // the null namespace
+        // (<https://html.spec.whatwg.org/multipage/dom.html#the-lang-and-xml:lang-attributes>).
+        let attrs = self.attrs()?;
+        attrs
+            .iter()
+            .find(|attr| attr.name.local == local_name!("lang") && attr.name.ns == ns!(xml))
+            .or_else(|| {
+                attrs.iter().find(|attr| {
+                    attr.name.local == local_name!("lang") && attr.name.ns.is_empty()
+                })
+            })
+            .map(|attr| style::selector_parser::AttrValue::from(attr.value.as_str()))
     }
 
     fn match_element_lang(
         &self,
-        _override_lang: Option<Option<style::selector_parser::AttrValue>>,
-        _value: &style::selector_parser::Lang,
+        override_lang: Option<Option<style::selector_parser::AttrValue>>,
+        value: &style::selector_parser::Lang,
     ) -> bool {
-        false
+        // The element's language is its nearest `lang`/`xml:lang` ancestor
+        // value; an inherited empty value means the language is unknown and
+        // stops the walk
+        // (<https://drafts.csswg.org/selectors-4/#the-lang-pseudo>).
+        let lang = match override_lang {
+            Some(lang) => lang,
+            None => inherited_lang(self),
+        };
+        lang.is_some_and(|lang| language_tag_matches(lang.as_ref(), value))
     }
 
     fn is_html_document_body_element(&self) -> bool {
