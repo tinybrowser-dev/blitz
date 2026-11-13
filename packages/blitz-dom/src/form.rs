@@ -5,6 +5,7 @@ use crate::{
     BaseDocument, ElementData,
     traversal::{AncestorTraverser, TreeTraverser},
 };
+use style_dom::ElementState;
 use blitz_traits::{
     navigation::NavigationOptions,
     net::{Body, Entry, EntryValue, FormData, Method},
@@ -287,8 +288,142 @@ impl BaseDocument {
         false
     }
 
-    /// Whether `node` is inside the first `legend` child of `fieldset`.
-    fn inside_first_legend(&self, node: NodeId, fieldset: NodeId) -> bool {
+    /// Whether `node_id` is "actually disabled", the condition `:disabled`
+    /// matches and `:enabled` negates
+    /// (<https://html.spec.whatwg.org/multipage/semantics-other.html#concept-element-disabled>).
+    pub fn actually_disabled(&self, node_id: NodeId) -> bool {
+        let Some(element) = self.get_node(node_id).and_then(|node| node.element_data()) else {
+            return false;
+        };
+        let local = &element.name.local;
+        if local == &local_name!("fieldset") {
+            // A disabled fieldset is one with the attribute, or one inside another
+            // disabled fieldset's group (outside its first `legend`)
+            // (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-fieldset-disabled>).
+            return element.has_attr(local_name!("disabled")) || self.disabled_by_fieldset(node_id);
+        }
+        if local == &local_name!("optgroup") {
+            return element.has_attr(local_name!("disabled"))
+                || self
+                    .nearest_ancestor_select(node_id, true)
+                    .is_some_and(|select| self.disabled_form_control(select));
+        }
+        if local == &local_name!("option") {
+            return self.option_disabled(node_id)
+                || self
+                    .nearest_ancestor_select(node_id, false)
+                    .is_some_and(|select| self.disabled_form_control(select));
+        }
+        self.disabled_form_control(node_id)
+    }
+
+    /// A button, input, select, or textarea is disabled by its own attribute
+    /// or by a disabled `fieldset` ancestor
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
+    fn disabled_form_control(&self, node_id: NodeId) -> bool {
+        self.get_node(node_id)
+            .is_some_and(|node| node.data.has_attr(local_name!("disabled")))
+            || self.disabled_by_fieldset(node_id)
+    }
+
+    /// An option is disabled through its own attribute or its nearest
+    /// `optgroup` ancestor. The search stops at a `select`, `hr`, `datalist`,
+    /// or `option` ancestor, which is why invalidly nested options do not
+    /// inherit disabledness
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-disabled>).
+    fn option_disabled(&self, node_id: NodeId) -> bool {
+        let Some(element) = self.get_node(node_id).and_then(|node| node.element_data()) else {
+            return false;
+        };
+        if element.has_attr(local_name!("disabled")) {
+            return true;
+        }
+        let mut current = node_id;
+        while let Some(parent) = self.get_node(current).and_then(|node| node.parent) {
+            let Some(element) = self.get_node(parent).and_then(|node| node.element_data()) else {
+                current = parent;
+                continue;
+            };
+            let local = &element.name.local;
+            if local == &local_name!("select")
+                || local == &local_name!("hr")
+                || local == &local_name!("datalist")
+                || local == &local_name!("option")
+            {
+                return false;
+            }
+            if local == &local_name!("optgroup") {
+                return element.has_attr(local_name!("disabled"));
+            }
+            current = parent;
+        }
+        false
+    }
+
+    /// The nearest `select` ancestor, `optgroup` and `option` inherit
+    /// disabledness from it. The walk stops at a `datalist`, `hr`, or `option`
+    /// ancestor, and at a second `optgroup`: an `optgroup` counts itself, so a
+    /// nested `optgroup` has none, and an `option` may have one
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#option-element-nearest-ancestor-select>).
+    fn nearest_ancestor_select(&self, node_id: NodeId, self_is_optgroup: bool) -> Option<NodeId> {
+        let mut seen_optgroup = self_is_optgroup;
+        let mut current = node_id;
+        while let Some(parent) = self.get_node(current).and_then(|node| node.parent) {
+            let Some(element) = self.get_node(parent).and_then(|node| node.element_data()) else {
+                current = parent;
+                continue;
+            };
+            let local = &element.name.local;
+            if local == &local_name!("datalist")
+                || local == &local_name!("hr")
+                || local == &local_name!("option")
+            {
+                return None;
+            }
+            if local == &local_name!("optgroup") {
+                if seen_optgroup {
+                    return None;
+                }
+                seen_optgroup = true;
+            }
+            if local == &local_name!("select") {
+                return Some(parent);
+            }
+            current = parent;
+        }
+        None
+    }
+
+    /// Recompute [`ElementState::DISABLED`] and [`ElementState::ENABLED`] for
+    /// `node_id` and every descendant.
+    ///
+    /// The bits cannot follow the `disabled` attribute alone: `fieldset`,
+    /// `select`, and `optgroup` ancestors disable their descendants, so a
+    /// change anywhere above a control has to resync the subtree below it.
+    pub fn sync_disabled_subtree(&mut self, node_id: NodeId) {
+        let mut stack = vec![node_id];
+        while let Some(id) = stack.pop() {
+            let Some(node) = self.get_node(id) else {
+                continue;
+            };
+            stack.extend(node.children.iter().copied());
+            if !node
+                .element_data()
+                .is_some_and(ElementData::can_be_disabled)
+            {
+                continue;
+            }
+            let disabled = self.actually_disabled(id);
+            let Some(element) = self.nodes[id].element_data_mut() else {
+                continue;
+            };
+            element.element_state.set(ElementState::DISABLED, disabled);
+            element.element_state.set(ElementState::ENABLED, !disabled);
+        }
+    }
+
+    /// Whether `node_id` is inside the first `legend` child of `fieldset`.
+    fn inside_first_legend(&self, node_id: NodeId, fieldset: NodeId) -> bool {
         let legend = self.get_node(fieldset).and_then(|current| {
             current.children.iter().copied().find(|child| {
                 self.get_node(*child)
@@ -299,16 +434,16 @@ impl BaseDocument {
             return false;
         };
         // Walk from `node` to the fieldset; the legend is on the path when the
-        // node is one of its descendants.
-        let mut current = node;
-        while let Some(parent) = self.get_node(current).and_then(|current| current.parent) {
-            if parent == legend {
+        // node is the legend itself or one of its descendants.
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            if id == legend {
                 return true;
             }
-            if parent == fieldset {
+            if id == fieldset {
                 return false;
             }
-            current = parent;
+            current = self.get_node(id).and_then(|node| node.parent);
         }
         false
     }

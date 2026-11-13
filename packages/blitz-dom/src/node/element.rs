@@ -658,7 +658,13 @@ impl ElementData {
     }
 
     pub fn can_be_disabled(&self) -> bool {
-        local_names!("button", "input", "select", "textarea").contains(&self.name.local)
+        // The elements that `:disabled` and `:enabled` can match
+        // (<https://html.spec.whatwg.org/multipage/semantics-other.html#selector-disabled>).
+        // Form-associated custom elements belong here too once custom elements exist.
+        local_names!(
+            "button", "input", "select", "textarea", "optgroup", "option", "fieldset"
+        )
+        .contains(&self.name.local)
     }
 
     /// Whether this element is a link (an `<a>` or `<area>` element with an `href` attribute)

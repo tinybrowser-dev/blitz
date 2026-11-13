@@ -644,7 +644,17 @@ impl DocumentMutator<'_> {
         }
 
         if *attr == local_name!("disabled") && element.can_be_disabled() {
+            let disables_descendants = element.name.local == local_name!("fieldset")
+                || element.name.local == local_name!("select")
+                || element.name.local == local_name!("optgroup");
             node.disable();
+            // A control inside a disabled fieldset, an optgroup inside a disabled
+            // select, and an option inside a disabled optgroup stay disabled when
+            // their own attribute goes away, so the bits come from the ancestors.
+            self.doc.sync_disabled_subtree(node_id);
+            if disables_descendants {
+                self.doc.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_DESCENDANTS);
+            }
             return;
         }
 
@@ -811,7 +821,14 @@ impl DocumentMutator<'_> {
         let attr = &name.local;
 
         if *attr == local_name!("disabled") && element.can_be_disabled() {
+            let disables_descendants = element.name.local == local_name!("fieldset")
+                || element.name.local == local_name!("select")
+                || element.name.local == local_name!("optgroup");
             node.enable();
+            self.doc.sync_disabled_subtree(node_id);
+            if disables_descendants {
+                self.doc.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_DESCENDANTS);
+            }
             return;
         }
 
@@ -1269,6 +1286,9 @@ impl DocumentMutator<'_> {
 
             if child_was_in_doc {
                 self.restyle_for_child_list_change(old_parent_id, index..index);
+                // Removing a `legend` can make another legend the fieldset's
+                // first legend child, which re-enables that legend's contents.
+                self.sync_disabled_children_of_fieldset(old_parent_id, true);
                 devtools!(
                     self,
                     MutationRecord::NodeRemoved(NodeRemoved {
@@ -1317,6 +1337,21 @@ impl DocumentMutator<'_> {
             }
         }
 
+        // A control's disabledness comes from its `fieldset`, `select`, and
+        // `optgroup` ancestors, so a moved subtree has to recompute those
+        // bits. The bits are live before the subtree enters a document: script
+        // builds a tree bottom-up and queries `:disabled` while it is still
+        // detached. A disabled fieldset also resyncs its existing children,
+        // because the inserted node may be its new first `legend` child.
+        if self.is_disabled_fieldset(parent_id) {
+            let in_document = new_parent_is_in_document;
+            self.sync_disabled_children_of_fieldset(parent_id, in_document);
+        } else {
+            for child_id in child_ids.iter().copied() {
+                self.doc.sync_disabled_subtree(child_id);
+            }
+        }
+
         // Transfer :focus-within from the old ancestor chain to the new one (the
         // shared prefix stays). If the subtree left the document, the focus was
         // cleared with it and only the old chain needs the state removed.
@@ -1346,6 +1381,27 @@ impl DocumentMutator<'_> {
 
         self.maybe_record_node(parent_id);
         self.note_placeholder_shown(parent_id);
+    }
+
+    /// Resync the subtree of a disabled `fieldset` after its child list
+    /// changed, and force the descendants to restyle when their state bits
+    /// moved. A no-op for any other element.
+    fn sync_disabled_children_of_fieldset(&mut self, node_id: NodeId, in_document: bool) {
+        if !self.is_disabled_fieldset(node_id) {
+            return;
+        }
+        self.doc.sync_disabled_subtree(node_id);
+        if in_document {
+            self.doc.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_DESCENDANTS);
+        }
+    }
+
+    /// Whether `node_id` is a `fieldset` whose own `disabled` attribute is set.
+    fn is_disabled_fieldset(&self, node_id: NodeId) -> bool {
+        self.doc.nodes[node_id].element_data().is_some_and(|element| {
+            element.name.local == local_name!("fieldset")
+                && element.has_attr(local_name!("disabled"))
+        })
     }
 
     /// Snapshot, then recompute `:placeholder-shown` for a control whose text
