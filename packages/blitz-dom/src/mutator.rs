@@ -1885,14 +1885,23 @@ impl<'doc> DocumentMutator<'doc> {
     /// insertion or removing steps
     /// (<https://dom.spec.whatwg.org/#concept-node-move>).
     pub fn move_node(&mut self, node_id: NodeId, parent_id: NodeId, before: Option<NodeId>) {
+        let new_parent_in_document = self.doc.nodes[parent_id].flags.is_in_document();
         let old_parent = self.doc.nodes[node_id].parent.take();
+        let old_parent_in_document = old_parent
+            .is_some_and(|id| self.doc.nodes[id].flags.is_in_document());
+        let old_index = old_parent.and_then(|old_parent| {
+            self.doc.nodes[old_parent]
+                .children
+                .iter()
+                .position(|id| *id == node_id)
+        });
         if let Some(old_parent) = old_parent {
             self.doc.nodes[old_parent]
                 .children
                 .retain(|id| *id != node_id);
             self.doc.nodes[old_parent].insert_damage(ALL_DAMAGE);
         }
-        {
+        let index = {
             let parent = &mut self.doc.nodes[parent_id];
             parent.insert_damage(ALL_DAMAGE);
             match before {
@@ -1903,15 +1912,49 @@ impl<'doc> DocumentMutator<'doc> {
                         .position(|id| *id == before)
                         .expect("move reference is a child of the new parent");
                     parent.children.insert(index, node_id);
+                    index
                 }
-                None => parent.children.push(node_id),
+                None => {
+                    let index = parent.children.len();
+                    parent.children.push(node_id);
+                    index
+                }
             }
-        }
+        };
         self.doc.nodes[node_id].parent = Some(parent_id);
         self.doc.nodes[node_id].insert_damage(ALL_DAMAGE);
         self.doc.nodes[node_id].mark_ancestors_dirty();
         self.doc.reorder_stylesheets_in_subtree(node_id);
         self.mutations_occurred = true;
+
+        // A move is a child-list change at both ends, so selectors that read
+        // the children (`:empty`, `:first-child`, `:nth-child`, `:has(>)`,
+        // sibling combinators) go stale unless the parents restyle exactly as
+        // they would for an insertion or removal.
+        if old_parent_in_document
+            && let Some(old_parent) = old_parent
+            && old_parent != parent_id
+        {
+            self.restyle_for_child_list_change(old_parent, old_index.unwrap_or(0)..old_index.unwrap_or(0));
+        }
+        if new_parent_in_document {
+            self.restyle_for_child_list_change(parent_id, index..index + 1);
+            // A same-parent move keeps the node's existing style data, so the
+            // traversal only recascades it when there is a hint: its own
+            // `:first-child`/`:nth-child`/`:has()` position changed.
+            if self.doc.nodes[node_id].primary_styles().is_some() {
+                self.doc.nodes[node_id].set_restyle_hint(RestyleHint::restyle_subtree());
+            }
+        }
+
+        // The moved subtree's `:disabled` bits depend on its ancestors, and a
+        // move into or out of a disabled `fieldset` changes which legend is
+        // first.
+        self.doc.sync_disabled_subtree(node_id);
+        if let Some(old_parent) = old_parent {
+            self.sync_disabled_children_of_fieldset(old_parent, old_parent_in_document);
+        }
+        self.sync_disabled_children_of_fieldset(parent_id, new_parent_in_document);
     }
 
     fn maybe_record_node(&mut self, node_id: impl Into<Option<NodeId>>) {
