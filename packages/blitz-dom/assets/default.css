@@ -90,8 +90,12 @@ textarea {
     font-family: monospace;
 }
 
+/* The default focus ring is `outline-style: auto`, the UA-chosen style, which
+   the paint backend draws as a solid ring. Browsers report `auto` here, and
+   `css/selectors/focus-visible-*.html` asserts it
+   (<https://drafts.csswg.org/selectors-4/#the-focus-visible-pseudo>). */
 :focus-visible {
-    outline: 2px solid #4D90FE;
+    outline: 2px auto #4D90FE;
 }
 
 button,

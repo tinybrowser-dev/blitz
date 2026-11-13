@@ -601,8 +601,11 @@ impl ElementCx<'_, '_> {
             .resolve_to_absolute(&current_color)
             .as_srgb_color();
 
+        // `auto` lets the user agent pick the ring; draw it solid, which is
+        // what the native focus rings look like
+        // (<https://drafts.csswg.org/css-ui-4/#valdef-outline-style-auto>).
         let style = match outline.outline_style {
-            OutlineStyle::Auto => return,
+            OutlineStyle::Auto => BorderStyle::Solid,
             OutlineStyle::BorderStyle(style) => style,
         };
 
