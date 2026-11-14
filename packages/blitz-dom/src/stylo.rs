@@ -223,6 +223,30 @@ impl crate::document::BaseDocument {
     /// (styling any unstyled ancestors along the way) without storing it on the
     /// node. Returns `None` for non-elements and elements outside the document.
     pub fn resolve_undisplayed_style(&self, node_id: NodeId) -> Option<Arc<ComputedValues>> {
+        self.resolve_undisplayed_styles(node_id)?
+            .get_primary()
+            .cloned()
+    }
+
+    /// [`Self::resolve_undisplayed_style`] for one of an element's eager
+    /// pseudo-elements, for `getComputedStyle()`. A pseudo-element the style
+    /// engine would not generate has no style of its own
+    /// (<https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle>).
+    pub fn resolve_undisplayed_pseudo_style(
+        &self,
+        node_id: NodeId,
+        pseudo: PseudoElement,
+    ) -> Option<Arc<ComputedValues>> {
+        self.resolve_undisplayed_styles(node_id)?
+            .pseudos
+            .get(&pseudo)
+            .cloned()
+    }
+
+    /// The primary and eager pseudo-element styles of an element the regular
+    /// style traversal skipped because it lives inside a `display: none`
+    /// subtree.
+    fn resolve_undisplayed_styles(&self, node_id: NodeId) -> Option<style::data::ElementStyles> {
         let node = self.nodes.get(node_id)?;
         if !node.is_element() || !node.flags.is_in_document() {
             return None;
@@ -258,7 +282,7 @@ impl crate::document::BaseDocument {
 
         style::thread_state::exit(ThreadState::LAYOUT);
 
-        Some(styles.primary().clone())
+        Some(styles)
     }
 }
 

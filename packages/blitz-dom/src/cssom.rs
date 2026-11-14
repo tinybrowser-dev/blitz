@@ -470,6 +470,14 @@ impl BaseDocument {
         })
     }
 
+    /// The number of longhand properties a computed style reports
+    /// (`CSSStyleDeclaration.length` on a computed style): every longhand the
+    /// engine supports has an entry in the block
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-length>).
+    pub fn computed_style_longhand_count() -> usize {
+        <style::properties::LonghandId as style::properties::IndexedId>::COUNT
+    }
+
     /// The CSSOM-visible attributes of the rule at `path`
     pub fn stylesheet_rule_info(&self, node_id: NodeId, path: &[usize]) -> Option<CssRuleInfo> {
         self.cssom_rule_info(self.node_cssom_sheet.get(&node_id).copied()?, path)

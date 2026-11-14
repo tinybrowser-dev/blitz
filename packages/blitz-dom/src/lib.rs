@@ -81,7 +81,8 @@ mod url;
 
 pub use cssom::{CssRuleInfo, CssomError};
 pub use resolved_style::{
-    css_property_is_supported, parse_transform_matrix, resolved_style_property_names,
+    ComputedPseudoElement, css_property_is_supported, parse_computed_pseudo_element,
+    parse_transform_matrix, resolved_style_property_names,
 };
 pub use stylo_taffy::CopyStyleGetters;
 pub use stylo_to_kurbo::resolve_2d_transform;

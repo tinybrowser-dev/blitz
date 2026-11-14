@@ -6,7 +6,7 @@
 //! `transform-origin`, grid track sizes) it is the *used* value, computed from
 //! the most recent layout.
 
-use cssparser::Parser;
+use cssparser::{Parser, Token};
 use selectors::matching::QuirksMode;
 use style::computed_values::box_sizing::T as BoxSizing;
 use style::computed_values::position::T as Position;
@@ -17,6 +17,7 @@ use style::properties::{
     PropertyDeclarationId, PropertyId, ShorthandId, SourcePropertyDeclaration,
     parse_one_declaration_into,
 };
+use style::selector_parser::PseudoElement;
 use style::servo_arc::Arc as ServoArc;
 use style::stylesheets::supports_rule::parse_condition_or_declaration;
 use style::stylesheets::{CssRuleType, Origin, OriginSet, UrlExtraData};
@@ -710,6 +711,121 @@ impl BaseDocument {
         canonicalize_computed_alignment(property_name, css)
     }
 
+    /// The resolved value of `property` on one of `node_id`'s pseudo-elements,
+    /// for `getComputedStyle(elt, pseudoElt)`. A pseudo-element that generates
+    /// a box resolves layout-dependent properties to used values like any box;
+    /// one that does not (no `content`, or an originating element inside a
+    /// `display: none` subtree) resolves them from its computed style.
+    ///
+    /// <https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle>
+    pub fn resolved_pseudo_style_value(
+        &self,
+        node_id: NodeId,
+        pseudo: PseudoElement,
+        property_name: &str,
+    ) -> String {
+        let Some(node) = self.get_node(node_id) else {
+            return String::new();
+        };
+        if !node.flags.is_in_document() {
+            return String::new();
+        }
+        // Only the eager pseudo-elements take part in the cascade. The lazy
+        // ones (`::marker`, `::backdrop`, …) are recorded in
+        // `docs/limitations.md`.
+        if !pseudo.is_eager() {
+            return String::new();
+        }
+        // A generated `::before`/`::after` is laid out as a box of its own, so
+        // its layout-dependent properties resolve to used values.
+        let layout_node = if pseudo == PseudoElement::Before {
+            node.before()
+        } else if pseudo == PseudoElement::After {
+            node.after()
+        } else {
+            None
+        };
+        if let Some(layout_node) = layout_node {
+            return self.resolved_style_value(layout_node, property_name);
+        }
+        let stored = node.try_stylo_element_data().and_then(|data| data.get());
+        let undisplayed;
+        let pseudo_style = match &stored {
+            Some(data) => data.styles.pseudos.get(&pseudo).cloned(),
+            None => {
+                undisplayed = self.resolve_undisplayed_pseudo_style(node_id, pseudo);
+                undisplayed.clone()
+            }
+        };
+        let Some(pseudo_style) = pseudo_style else {
+            return String::new();
+        };
+        let Ok(property_id) = PropertyId::parse_enabled_for_all_content(property_name) else {
+            return String::new();
+        };
+        let css = match property_id.as_shorthand() {
+            Ok(shorthand) => serialize_resolved_shorthand(&pseudo_style, shorthand),
+            Err(declaration_id) => pseudo_style.computed_value_to_string(declaration_id),
+        };
+        canonicalize_computed_alignment(property_name, css)
+    }
+
+    /// The names a computed style declaration reports, in CSSOM's order: every
+    /// supported longhand in lexicographical order, then the custom properties
+    /// whose computed value is not the guaranteed-invalid value
+    /// (`CSSStyleDeclaration.length`, `item()`, and the indexed getter on a
+    /// computed style)
+    /// (<https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle>).
+    pub fn computed_style_property_names(
+        &self,
+        node_id: NodeId,
+        pseudo: Option<PseudoElement>,
+    ) -> Vec<String> {
+        let Some(node) = self.get_node(node_id) else {
+            return Vec::new();
+        };
+        if !node.flags.is_in_document() {
+            return Vec::new();
+        }
+        let style = match pseudo {
+            Some(pseudo) => {
+                if !pseudo.is_eager() {
+                    return Vec::new();
+                }
+                let stored = node.try_stylo_element_data().and_then(|data| data.get());
+                match &stored {
+                    Some(data) => data.styles.pseudos.get(&pseudo).cloned(),
+                    None => self.resolve_undisplayed_pseudo_style(node_id, pseudo),
+                }
+            }
+            None => match node.primary_styles() {
+                Some(styles) => Some(ServoArc::clone(&styles)),
+                None => self.resolve_undisplayed_style(node_id),
+            },
+        };
+        let Some(style) = style else {
+            return Vec::new();
+        };
+        let styles: &ComputedValues = &style;
+        let mut names: Vec<String> = resolved_style_property_names()
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let mut custom = Vec::new();
+        let custom_properties = styles.custom_properties();
+        let mut index = 0;
+        while let Some((name, _)) = custom_properties.property_at(index) {
+            // The map key is the name without its `--` prefix, while CSSOM
+            // reports the full custom property name.
+            custom.push(format!("--{name}"));
+            index += 1;
+        }
+        // The custom properties follow the longhands in lexicographical order
+        custom.sort_unstable();
+        names.extend(custom);
+        names
+    }
+
     /// Whether the node's box is a flex or grid item, i.e. its nearest ancestor
     /// that generates a box (skipping `display: contents` ancestors) is a flex
     /// or grid container.
@@ -727,6 +843,131 @@ impl BaseDocument {
             return matches!(display.inside(), DisplayInside::Flex | DisplayInside::Grid);
         }
         false
+    }
+}
+
+/// The pseudo-element a `getComputedStyle(elt, pseudoElt)` argument names,
+/// after parsing it as a `<pseudo-element-selector>`
+/// (<https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle>).
+pub enum ComputedPseudoElement {
+    /// A pseudo-element the style engine cascades and stores a style for.
+    Cascaded(PseudoElement),
+    /// A pseudo-element CSSOM recognises but the style engine does not
+    /// cascade; the declaration still answers, with initial values where the
+    /// engine has none.
+    Unsupported,
+    /// Not a `<pseudo-element-selector>`, or one CSSOM sends to the empty
+    /// declaration (`::slotted()` and `::part()`).
+    Invalid,
+}
+
+/// The pseudo-element a `getComputedStyle` argument names. The argument must
+/// parse as one complete `<pseudo-element-selector>`: one or two colons, an
+/// identifier, and for a functional pseudo-element a single `<custom-ident>`
+/// argument. A single-colon argument reaches only the legacy pseudo-elements.
+///
+/// <https://drafts.csswg.org/selectors-4/#typedef-pseudo-element-selector>
+pub fn parse_computed_pseudo_element(text: &str) -> ComputedPseudoElement {
+    let mut input = Parser::new(text);
+    let mut colons = 0;
+    loop {
+        match input.next_including_whitespace() {
+            Ok(Token::Colon) => {
+                colons += 1;
+                if colons > 2 {
+                    return ComputedPseudoElement::Invalid;
+                }
+            }
+            Ok(Token::Ident(name)) => {
+                let name = name.to_string();
+                // A trailing token (whitespace, a function, …) leaves a
+                // selector that is not a single pseudo-element selector.
+                if input.next_including_whitespace().is_ok() {
+                    return ComputedPseudoElement::Invalid;
+                }
+                return simple_pseudo_element(colons, &name);
+            }
+            Ok(Token::Function(name)) => {
+                // A functional pseudo-element needs the double-colon spelling;
+                // its argument is one `<custom-ident>` and nothing else.
+                let name = name.to_string();
+                if colons != 2 {
+                    return ComputedPseudoElement::Invalid;
+                }
+                let mut ident = None;
+                let parsed: Result<(), cssparser::ParseError<cssparser::BasicParseErrorKind>> =
+                    input.parse_nested_block(|arguments| {
+                        let Ok(Token::Ident(value)) = arguments.next() else {
+                            return Ok(());
+                        };
+                        let value = value.to_string();
+                        // Only whitespace may follow the argument.
+                        if arguments.expect_exhausted().is_ok() {
+                            ident = Some(value);
+                        }
+                        Ok(())
+                    });
+                let Some(ident) = ident else {
+                    return ComputedPseudoElement::Invalid;
+                };
+                if parsed.is_err() || input.next_including_whitespace().is_ok() {
+                    return ComputedPseudoElement::Invalid;
+                }
+                return functional_pseudo_element(&name, &ident);
+            }
+            _ => return ComputedPseudoElement::Invalid,
+        }
+    }
+}
+
+/// The pseudo-element a non-functional `::name` argument names, given how many
+/// colons preceded it.
+fn simple_pseudo_element(colons: usize, name: &str) -> ComputedPseudoElement {
+    let name = name.to_ascii_lowercase();
+    match (colons, name.as_str()) {
+        (_, "before") => ComputedPseudoElement::Cascaded(PseudoElement::Before),
+        (_, "after") => ComputedPseudoElement::Cascaded(PseudoElement::After),
+        (2, "selection") => ComputedPseudoElement::Cascaded(PseudoElement::Selection),
+        (_, "first-line") => ComputedPseudoElement::Cascaded(PseudoElement::FirstLine),
+        (_, "first-letter") => ComputedPseudoElement::Cascaded(PseudoElement::FirstLetter),
+        // Pseudo-elements CSSOM knows but the style engine does not cascade.
+        (
+            2,
+            "backdrop"
+            | "details-content"
+            | "marker"
+            | "placeholder"
+            | "file-selector-button"
+            | "color-swatch"
+            | "grammar-error"
+            | "spelling-error"
+            | "view-transition"
+            | "target-text"
+            | "cue",
+        ) => ComputedPseudoElement::Unsupported,
+        _ => ComputedPseudoElement::Invalid,
+    }
+}
+
+/// The pseudo-element a functional `::name(...)` argument names. `::part()` and
+/// `::slotted()` are not reachable from `getComputedStyle`; every other
+/// functional pseudo-element the engine does not cascade still answers a
+/// declaration.
+fn functional_pseudo_element(name: &str, argument: &str) -> ComputedPseudoElement {
+    let argument = argument.to_ascii_lowercase();
+    match name.to_ascii_lowercase().as_str() {
+        "part" | "slotted" => ComputedPseudoElement::Invalid,
+        // `::picker()` only accepts the `select` keyword, so any other
+        // argument is not a pseudo-element selector
+        // (<https://drafts.csswg.org/css-forms-1/#picker-pseudo>).
+        "picker" if argument != "select" => ComputedPseudoElement::Invalid,
+        "highlight"
+        | "picker"
+        | "view-transition-group"
+        | "view-transition-image-pair"
+        | "view-transition-old"
+        | "view-transition-new" => ComputedPseudoElement::Unsupported,
+        _ => ComputedPseudoElement::Invalid,
     }
 }
 
