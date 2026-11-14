@@ -44,7 +44,10 @@ pub(crate) struct CssomSheetRecord {
     pub sheet: DocumentStyleSheet,
     pub origin_clean: bool,
     pub live: bool,
-    pub owner: NodeId,
+    /// The element that owns this sheet, or `None` for a sheet reached only
+    /// through an `@import` rule
+    /// (<https://drafts.csswg.org/cssom/#dom-stylesheet-ownernode>).
+    pub owner: Option<NodeId>,
 }
 
 /// Errors from CSSOM mutation operations, mirroring the `DOMException` names
@@ -470,6 +473,44 @@ impl BaseDocument {
         })
     }
 
+    /// The CSSOM sheet id for the sheet an `@import` rule imports, or `None`
+    /// when the rule at `path` is not an import with a loaded sheet. The
+    /// record has no owner node, so `CSSStyleSheet.ownerNode` is null while
+    /// `parentStyleSheet` and `ownerRule` point at the importing sheet and
+    /// rule
+    /// (<https://drafts.csswg.org/cssom/#dom-cssimportrule-stylesheet>).
+    pub fn cssom_import_sheet(&mut self, sheet_id: u64, path: &[usize]) -> Option<u64> {
+        let record = self.cssom_sheets.get(&sheet_id)?;
+        let sheet = record.sheet.clone();
+        let origin_clean = record.origin_clean;
+        let imported = {
+            let guard = self.guard.read();
+            let handle = Self::resolve_rule(&sheet, &guard, path, |_| {})?;
+            let RuleHandle::Rule(CssRule::Import(import)) = handle else {
+                return None;
+            };
+            match &import.read_with(&guard).stylesheet {
+                ImportSheet::Sheet(imported) => DocumentStyleSheet(imported.clone()),
+                // A pending import has no sheet yet, and a refused one never
+                // gets one
+                // (<https://drafts.csswg.org/cssom/#dom-cssimportrule-stylesheet>).
+                ImportSheet::Pending | ImportSheet::Refused => return None,
+            }
+        };
+        let id = self.next_cssom_sheet;
+        self.next_cssom_sheet = self.next_cssom_sheet.saturating_add(1);
+        self.cssom_sheets.insert(
+            id,
+            CssomSheetRecord {
+                sheet: imported,
+                origin_clean,
+                live: true,
+                owner: None,
+            },
+        );
+        Some(id)
+    }
+
     /// The number of longhand properties a computed style reports
     /// (`CSSStyleDeclaration.length` on a computed style): every longhand the
     /// engine supports has an entry in the block
@@ -620,7 +661,7 @@ impl BaseDocument {
                     None,
                     self.tx.clone(),
                     self.id(),
-                    Some(owner),
+                    owner,
                     &self.net_provider,
                     &self.shell_provider,
                     &guard,

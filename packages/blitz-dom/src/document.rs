@@ -1887,7 +1887,7 @@ impl BaseDocument {
                 sheet: stylesheet,
                 origin_clean,
                 live: true,
-                owner: node_id,
+                owner: Some(node_id),
             },
         );
         id
