@@ -27,6 +27,7 @@ use style::stylesheets::{
     AllowImportRules, CssRule, CssRuleRef, CssRuleType, CssRuleTypes, CssRules, DocumentStyleSheet,
     Origin, OriginSet, RulesMutateError, StylesheetInDocument,
 };
+use style::values::KeyframesName;
 use style_traits::{CssStringWriter, ParsingMode, ToCss};
 // For `SelectorList::to_css_string`
 use cssparser::ToCss as _;
@@ -249,7 +250,12 @@ fn rule_attributes(rule: &CssRule, guard: &SharedRwLockReadGuard) -> Vec<(&'stat
         CssRule::Supports(r) => vec![("conditionText", r.condition.to_css_string())],
         CssRule::Container(r) => vec![("conditionText", r.conditions.to_css_string())],
         CssRule::Page(r) => vec![("selectorText", r.read_with(guard).selectors.to_css_string())],
-        CssRule::Keyframes(r) => vec![("name", r.read_with(guard).name.to_css_string())],
+        CssRule::Keyframes(r) => vec![
+            // `name` is the raw keyframes name: CSSOM quotes it only when it
+            // serializes the rule, never in the attribute
+            // (<https://drafts.csswg.org/css-animations-1/#dom-csskeyframesrule-name>).
+            ("name", r.read_with(guard).name.as_atom().to_string()),
+        ],
         CssRule::LayerBlock(r) => vec![(
             "name",
             r.name
@@ -1114,6 +1120,74 @@ impl BaseDocument {
             );
         }
         Ok(())
+    }
+
+    /// Renames a `@keyframes` rule (`CSSKeyframesRule.name` setter). The value
+    /// is stored as written; serialization quotes it when it is not a valid
+    /// `<custom-ident>`.
+    ///
+    /// <https://drafts.csswg.org/css-animations-1/#dom-csskeyframesrule-name>
+    pub fn cssom_rule_set_name(
+        &mut self,
+        sheet_id: u64,
+        path: &[usize],
+        name: &str,
+    ) -> Result<(), CssomError> {
+        let record = self
+            .cssom_sheets
+            .get(&sheet_id)
+            .ok_or(CssomError::NotFound)?;
+        let live = record.live;
+        let sheet = record.sheet.clone();
+        let lock = &self.guard;
+        let (ancestors, rule) = {
+            let guard = lock.read();
+            let mut ancestors = Vec::with_capacity(path.len());
+            let handle =
+                Self::resolve_rule(&sheet, &guard, path, |rule| ancestors.push(rule.clone()))
+                    .ok_or(CssomError::NotFound)?;
+            let RuleHandle::Rule(rule @ CssRule::Keyframes(_)) = handle else {
+                return Err(CssomError::NotSupported);
+            };
+            (ancestors, rule)
+        };
+        let CssRule::Keyframes(keyframes) = &rule else {
+            return Err(CssomError::NotSupported);
+        };
+        {
+            let mut guard = lock.write();
+            keyframes.write_with(&mut guard).name = KeyframesName::from_ident(name);
+        }
+        let guard = lock.read();
+        if live {
+            let ancestor_refs: Vec<CssRuleRef> = ancestors.iter().map(CssRuleRef::from).collect();
+            self.stylist.rule_changed(
+                &sheet,
+                &rule,
+                &guard,
+                RuleChangeKind::Generic,
+                &ancestor_refs,
+            );
+        }
+        Ok(())
+    }
+
+    /// The index of the last keyframe whose selector list parses as `select`
+    /// and matches, or `None` (`CSSKeyframesRule.findRule`)
+    /// (<https://drafts.csswg.org/css-animations-1/#dom-csskeyframesrule-findrule>).
+    pub fn cssom_find_keyframe(
+        &self,
+        sheet_id: u64,
+        path: &[usize],
+        select: &str,
+    ) -> Option<usize> {
+        let sheet = self.cssom_sheet(sheet_id)?;
+        let guard = self.guard.read();
+        let handle = Self::resolve_rule(sheet, &guard, path, |_| {})?;
+        let RuleHandle::Rule(CssRule::Keyframes(keyframes)) = handle else {
+            return None;
+        };
+        keyframes.read_with(&guard).find_rule(&guard, select)
     }
 
     /// Replaces a keyframe's selector list (`CSSKeyframeRule.keyText`
