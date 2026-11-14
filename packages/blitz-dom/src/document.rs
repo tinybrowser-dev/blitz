@@ -428,6 +428,10 @@ pub struct BaseDocument {
     pub(crate) nodes_to_id: HashMap<String, SmallVec<[NodeId; 1]>>,
     /// Map of `<style>` and `<link>` node IDs to their associated stylesheet
     pub(crate) nodes_to_stylesheet: BTreeMap<NodeId, DocumentStyleSheet>,
+    /// The document's adopted stylesheets, in cascade order. They apply after
+    /// every stylesheet an element owns
+    /// (<https://drafts.csswg.org/cssom/#extensions-to-the-document-or-shadow-root-interface>).
+    pub(crate) adopted_stylesheets: Vec<DocumentStyleSheet>,
     /// Incremented whenever `nodes_to_stylesheet` changes (a stylesheet is
     /// added, replaced or removed), so that CSSOM wrappers can detect that
     /// their cached rule data is stale.
@@ -823,6 +827,7 @@ impl BaseDocument {
             devtool_settings: DevtoolSettings::default(),
             url: base_url,
             nodes_to_stylesheet: BTreeMap::new(),
+            adopted_stylesheets: Vec::new(),
             stylesheet_generation: 0,
             cssom_sheets: HashMap::new(),
             node_cssom_sheet: HashMap::new(),
@@ -2045,6 +2050,11 @@ impl BaseDocument {
         if let Some(insertion_point) = insertion_point {
             self.stylist
                 .insert_stylesheet_before(stylesheet, insertion_point, &self.guard.read())
+        } else if let Some(first_adopted) = self.adopted_stylesheets.first().cloned() {
+            // A document sheet always precedes the document's adopted sheets
+            // (<https://drafts.csswg.org/cssom/#extensions-to-the-document-or-shadow-root-interface>).
+            self.stylist
+                .insert_stylesheet_before(stylesheet, first_adopted, &self.guard.read())
         } else {
             self.stylist
                 .append_stylesheet(stylesheet, &self.guard.read())

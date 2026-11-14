@@ -25,7 +25,8 @@ use style::stylesheets::import_rule::ImportSheet;
 use style::stylesheets::keyframes_rule::{Keyframe, KeyframeSelectors, KeyframesRule};
 use style::stylesheets::{
     AllowImportRules, CssRule, CssRuleRef, CssRuleType, CssRuleTypes, CssRules, DocumentStyleSheet,
-    Origin, OriginSet, RulesMutateError, Stylesheet, StylesheetInDocument, UrlExtraData,
+    Origin, OriginSet, RulesMutateError, Stylesheet, StylesheetContents, StylesheetInDocument,
+    UrlExtraData,
 };
 use style::values::KeyframesName;
 use style_traits::{CssStringWriter, ParsingMode, ToCss};
@@ -537,10 +538,36 @@ impl BaseDocument {
         style::media_queries::MediaList::parse(&mut context, &mut parser)
     }
 
-    /// A stylesheet built from `css` for a constructable sheet. Relative
-    /// references resolve against `base_url`, or the document base URL when
-    /// the constructor gave none
+    /// Parsed contents for a constructable sheet. Relative references resolve
+    /// against `base_url`, or the document base URL when the constructor gave
+    /// none
     /// (<https://drafts.csswg.org/cssom/#dom-cssstylesheetinit-baseurl>).
+    fn make_constructable_contents(
+        &self,
+        css: &str,
+        base_url: Option<&url::Url>,
+    ) -> ServoArc<StylesheetContents> {
+        let url_data = match base_url {
+            Some(url) => UrlExtraData(ServoArc::new(url.clone())),
+            None => self.url.url_extra_data(),
+        };
+        StylesheetContents::from_str(
+            css,
+            url_data,
+            Origin::Author,
+            &self.guard,
+            Some(&self.stylesheet_loader()),
+            None,
+            self.quirks_mode(),
+            // A constructable sheet never loads an `@import`: `replaceSync`
+            // drops one and `insertRule` reports a syntax error
+            // (<https://wicg.github.io/construct-stylesheets/#dom-cssstylesheet-replacesync>).
+            AllowImportRules::No,
+            None,
+        )
+    }
+
+    /// A stylesheet built from `css` for a constructable sheet.
     fn make_constructable_stylesheet(
         &self,
         css: &str,
@@ -598,9 +625,8 @@ impl BaseDocument {
     }
 
     /// Replaces the rules of constructable sheet `sheet_id` with those parsed
-    /// from `css`, keeping the id so an already-returned `CSSStyleSheet` and
-    /// its `cssRules` address the new rules. `false` when the id names no
-    /// constructable sheet
+    /// from `css`, keeping the sheet's identity, media list, disabled flag and
+    /// cascade position. `false` when the id names no constructable sheet
     /// (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-replacesync>).
     pub fn cssom_replace_sheet(
         &mut self,
@@ -614,28 +640,86 @@ impl BaseDocument {
         if !record.constructable {
             return false;
         }
-        let media = record.sheet.0.media.clone();
+        let sheet = record.sheet.clone();
         let live = record.live;
-        let old = record.sheet.clone();
-        let sheet = self.make_constructable_stylesheet(css, media, base_url);
-        // `replace` swaps the rules, not the sheet's state: the disabled flag
-        // the constructor or a script set stays
-        // (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-replacesync>).
-        sheet.0.set_disabled(old.0.disabled());
-        let Some(record) = self.cssom_sheets.get_mut(&sheet_id) else {
-            return false;
-        };
-        record.origin_clean = true;
-        record.sheet = sheet.clone();
-        if live {
-            // An adopted sheet is in the cascade, so the swap has to reach the
-            // stylist; a free-standing sheet is not
+        let contents = self.make_constructable_contents(css, base_url);
+        {
+            // Only the contents are replaced, so an adopted sheet keeps its
+            // place in the cascade
             // (<https://wicg.github.io/construct-stylesheets/#dom-cssstylesheet-replacesync>).
-            let guard = self.guard.read();
-            self.stylist.remove_stylesheet(old, &guard);
-            self.stylist.append_stylesheet(sheet, &guard);
+            let mut guard = self.guard.write();
+            *sheet.0.contents.write_with(&mut guard) = contents;
+        }
+        if let Some(record) = self.cssom_sheets.get_mut(&sheet_id) {
+            record.origin_clean = true;
+        }
+        if live {
+            // Replacing every rule cannot be described as one rule change, so
+            // the whole origin is collected again
+            // (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-replacesync>).
+            self.stylist
+                .force_stylesheet_origins_dirty(OriginSet::all());
         }
         true
+    }
+
+    /// The document's adopted stylesheets, in cascade order
+    /// (<https://drafts.csswg.org/cssom/#dom-document-adoptedstylesheets>).
+    pub fn adopted_stylesheets(&self) -> &[DocumentStyleSheet] {
+        &self.adopted_stylesheets
+    }
+
+    /// Replaces the document's adopted stylesheet list with the CSSOM sheets
+    /// named by `ids`. Every id must name a constructable sheet; `false` and no
+    /// change otherwise
+    /// (<https://drafts.csswg.org/cssom/#dom-document-adoptedstylesheets>).
+    pub fn set_adopted_stylesheets(&mut self, ids: &[u64]) -> bool {
+        let mut sheets = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(record) = self.cssom_sheets.get(id) else {
+                return false;
+            };
+            if !record.constructable {
+                return false;
+            }
+            sheets.push(record.sheet.clone());
+        }
+        let old = std::mem::take(&mut self.adopted_stylesheets);
+        {
+            let guard = self.guard.read();
+            for sheet in &old {
+                self.stylist.remove_stylesheet(sheet.clone(), &guard);
+            }
+            // Adopted sheets apply after every document sheet, in list order
+            // (<https://drafts.csswg.org/cssom/#extensions-to-the-document-or-shadow-root-interface>).
+            for sheet in &sheets {
+                self.stylist.append_stylesheet(sheet.clone(), &guard);
+            }
+        }
+        self.adopted_stylesheets = sheets;
+        // An adopted sheet has to notify the stylist of rule edits; one that
+        // left the list no longer applies
+        let adopted = self.adopted_stylesheets.clone();
+        for record in self.cssom_sheets.values_mut() {
+            if record.constructable {
+                record.live = adopted.contains(&record.sheet);
+            }
+        }
+        self.needs_resolve = true;
+        true
+    }
+
+    /// The CSSOM ids of the document's adopted stylesheets, in cascade order.
+    pub fn adopted_stylesheet_ids(&self) -> Vec<u64> {
+        self.adopted_stylesheets
+            .iter()
+            .filter_map(|sheet| {
+                self.cssom_sheets
+                    .iter()
+                    .find(|(_, record)| &record.sheet == sheet)
+                    .map(|(id, _)| *id)
+            })
+            .collect()
     }
 
     /// The media query list text of CSSOM sheet `sheet_id`
