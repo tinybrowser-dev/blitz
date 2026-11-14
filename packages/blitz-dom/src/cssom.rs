@@ -25,7 +25,7 @@ use style::stylesheets::import_rule::ImportSheet;
 use style::stylesheets::keyframes_rule::{Keyframe, KeyframeSelectors, KeyframesRule};
 use style::stylesheets::{
     AllowImportRules, CssRule, CssRuleRef, CssRuleType, CssRuleTypes, CssRules, DocumentStyleSheet,
-    Origin, OriginSet, RulesMutateError, StylesheetInDocument,
+    Origin, OriginSet, RulesMutateError, Stylesheet, StylesheetInDocument, UrlExtraData,
 };
 use style::values::KeyframesName;
 use style_traits::{CssStringWriter, ParsingMode, ToCss};
@@ -45,9 +45,14 @@ pub(crate) struct CssomSheetRecord {
     pub origin_clean: bool,
     pub live: bool,
     /// The element that owns this sheet, or `None` for a sheet reached only
-    /// through an `@import` rule
+    /// through an `@import` rule or created by the `CSSStyleSheet` constructor
     /// (<https://drafts.csswg.org/cssom/#dom-stylesheet-ownernode>).
     pub owner: Option<NodeId>,
+    /// Whether the sheet was created by the `CSSStyleSheet` constructor. A
+    /// constructable sheet has no owner, keeps its rules free-standing, and
+    /// never loads an `@import`
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-cssstylesheet>).
+    pub constructable: bool,
 }
 
 /// Errors from CSSOM mutation operations, mirroring the `DOMException` names
@@ -506,9 +511,182 @@ impl BaseDocument {
                 origin_clean,
                 live: true,
                 owner: None,
+                constructable: false,
             },
         );
         Some(id)
+    }
+
+    /// Parses `text` as a media query list. An invalid list parses to the
+    /// queries it does contain, as the CSSOM `mediaText` setter requires
+    /// (<https://drafts.csswg.org/cssom/#dom-medialist-mediatext>).
+    fn parse_media_list(&self, text: &str) -> style::media_queries::MediaList {
+        let url_data = self.url.url_extra_data();
+        let mut context = ParserContext::new(
+            Origin::Author,
+            &url_data,
+            None,
+            ParsingMode::DEFAULT,
+            QuirksMode::NoQuirks,
+            Default::default(),
+            None,
+            None,
+            Default::default(),
+        );
+        let mut parser = Parser::new(text);
+        style::media_queries::MediaList::parse(&mut context, &mut parser)
+    }
+
+    /// A stylesheet built from `css` for a constructable sheet. Relative
+    /// references resolve against `base_url`, or the document base URL when
+    /// the constructor gave none
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstylesheetinit-baseurl>).
+    fn make_constructable_stylesheet(
+        &self,
+        css: &str,
+        media: ServoArc<style::shared_lock::Locked<style::media_queries::MediaList>>,
+        base_url: Option<&url::Url>,
+    ) -> DocumentStyleSheet {
+        let url_data = match base_url {
+            Some(url) => UrlExtraData(ServoArc::new(url.clone())),
+            None => self.url.url_extra_data(),
+        };
+        let data = Stylesheet::from_str(
+            css,
+            url_data,
+            Origin::Author,
+            media,
+            self.guard.clone(),
+            Some(&self.stylesheet_loader()),
+            None,
+            self.quirks_mode(),
+            // A constructable sheet never loads an `@import`: `replaceSync`
+            // drops one and `insertRule` reports a syntax error
+            // (<https://wicg.github.io/construct-stylesheets/#dom-cssstylesheet-replacesync>).
+            AllowImportRules::No,
+        );
+        DocumentStyleSheet(ServoArc::new(data))
+    }
+
+    /// Creates a constructable sheet holding `css` and registers a CSSOM record
+    /// for it with no owner node, returning the sheet's CSSOM id
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-cssstylesheet>).
+    pub fn create_constructable_sheet(
+        &mut self,
+        css: &str,
+        media_text: &str,
+        base_url: Option<&url::Url>,
+    ) -> u64 {
+        let media = ServoArc::new(self.guard.wrap(self.parse_media_list(media_text)));
+        let sheet = self.make_constructable_stylesheet(css, media, base_url);
+        let id = self.next_cssom_sheet;
+        self.next_cssom_sheet = self.next_cssom_sheet.saturating_add(1);
+        self.cssom_sheets.insert(
+            id,
+            CssomSheetRecord {
+                sheet,
+                // A sheet the constructor built carries only script-supplied
+                // CSS, so it is origin-clean
+                // (<https://drafts.csswg.org/cssom/#concept-css-style-sheet-origin-clean-flag>).
+                origin_clean: true,
+                live: false,
+                owner: None,
+                constructable: true,
+            },
+        );
+        id
+    }
+
+    /// Replaces the rules of constructable sheet `sheet_id` with those parsed
+    /// from `css`, keeping the id so an already-returned `CSSStyleSheet` and
+    /// its `cssRules` address the new rules. `false` when the id names no
+    /// constructable sheet
+    /// (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-replacesync>).
+    pub fn cssom_replace_sheet(
+        &mut self,
+        sheet_id: u64,
+        css: &str,
+        base_url: Option<&url::Url>,
+    ) -> bool {
+        let Some(record) = self.cssom_sheets.get(&sheet_id) else {
+            return false;
+        };
+        if !record.constructable {
+            return false;
+        }
+        let media = record.sheet.0.media.clone();
+        let live = record.live;
+        let old = record.sheet.clone();
+        let sheet = self.make_constructable_stylesheet(css, media, base_url);
+        // `replace` swaps the rules, not the sheet's state: the disabled flag
+        // the constructor or a script set stays
+        // (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-replacesync>).
+        sheet.0.set_disabled(old.0.disabled());
+        let Some(record) = self.cssom_sheets.get_mut(&sheet_id) else {
+            return false;
+        };
+        record.origin_clean = true;
+        record.sheet = sheet.clone();
+        if live {
+            // An adopted sheet is in the cascade, so the swap has to reach the
+            // stylist; a free-standing sheet is not
+            // (<https://wicg.github.io/construct-stylesheets/#dom-cssstylesheet-replacesync>).
+            let guard = self.guard.read();
+            self.stylist.remove_stylesheet(old, &guard);
+            self.stylist.append_stylesheet(sheet, &guard);
+        }
+        true
+    }
+
+    /// The media query list text of CSSOM sheet `sheet_id`
+    /// (`StyleSheet.media.mediaText`). `None` when the id names no sheet.
+    pub fn cssom_sheet_media_text(&self, sheet_id: u64) -> Option<String> {
+        let record = self.cssom_sheets.get(&sheet_id)?;
+        let guard = self.guard.read();
+        Some(record.sheet.media(&guard)?.to_css_string())
+    }
+
+    /// Replaces the media query list of CSSOM sheet `sheet_id`. `false` when
+    /// the id names no sheet
+    /// (<https://drafts.csswg.org/cssom/#dom-medialist-mediatext>).
+    pub fn set_cssom_sheet_media_text(&mut self, sheet_id: u64, text: &str) -> bool {
+        let Some(record) = self.cssom_sheets.get(&sheet_id) else {
+            return false;
+        };
+        let media = record.sheet.0.media.clone();
+        let live = record.live;
+        let list = self.parse_media_list(text);
+        {
+            let mut guard = self.guard.write();
+            *media.write_with(&mut guard) = list;
+        }
+        if live {
+            self.stylist
+                .force_stylesheet_origins_dirty(OriginSet::all());
+        }
+        true
+    }
+
+    /// Whether CSSOM sheet `sheet_id` is disabled
+    /// (`StyleSheet.disabled`). `None` when the id names no sheet.
+    pub fn cssom_sheet_disabled(&self, sheet_id: u64) -> Option<bool> {
+        self.cssom_sheets
+            .get(&sheet_id)
+            .map(|record| record.sheet.0.disabled())
+    }
+
+    /// Sets the disabled flag of CSSOM sheet `sheet_id`. A disabled sheet stays
+    /// associated with its owner but its rules no longer apply
+    /// (<https://drafts.csswg.org/cssom/#dom-stylesheet-disabled>).
+    pub fn set_cssom_sheet_disabled(&mut self, sheet_id: u64, disabled: bool) -> bool {
+        let Some(record) = self.cssom_sheets.get(&sheet_id) else {
+            return false;
+        };
+        if record.sheet.0.set_disabled(disabled) {
+            self.stylist
+                .force_stylesheet_origins_dirty(OriginSet::all());
+        }
+        true
     }
 
     /// The number of longhand properties a computed style reports
@@ -585,12 +763,17 @@ impl BaseDocument {
         rule: &str,
         index: usize,
     ) -> Result<usize, CssomError> {
-        let (sheet, live, owner) = {
+        let (sheet, live, owner, constructable) = {
             let record = self
                 .cssom_sheets
                 .get(&sheet_id)
                 .ok_or(CssomError::NotFound)?;
-            (record.sheet.clone(), record.live, record.owner)
+            (
+                record.sheet.clone(),
+                record.live,
+                record.owner,
+                record.constructable,
+            )
         };
         let loader = self.stylesheet_loader();
         let lock = &self.guard;
@@ -621,7 +804,14 @@ impl BaseDocument {
                         containing_rule_types,
                         parse_relative_rule_type,
                         Some(&loader),
-                        AllowImportRules::Yes,
+                        // A constructable sheet never loads an `@import`; the
+                        // parse fails so `insertRule` reports a syntax error
+                        // (<https://wicg.github.io/construct-stylesheets/#dom-cssstylesheet-replacesync>).
+                        if constructable {
+                            AllowImportRules::No
+                        } else {
+                            AllowImportRules::Yes
+                        },
                     )?
                 };
                 {
@@ -1378,6 +1568,18 @@ impl BaseDocument {
             .get(&node_id)
             .copied()
             .ok_or(CssomError::NotFound)?;
+        self.cssom_rule_style_set_css_text(sheet_id, path, css)
+    }
+
+    /// [`Self::stylesheet_rule_style_set_css_text`] for a CSSOM sheet id, so a
+    /// constructable sheet (which no element owns) can replace a rule's
+    /// declarations.
+    pub fn cssom_rule_style_set_css_text(
+        &mut self,
+        sheet_id: u64,
+        path: &[usize],
+        css: &str,
+    ) -> Result<(), CssomError> {
         let (sheet, ancestors, rule, target, live) = self
             .rule_declaration_target_mut(sheet_id, path)
             .ok_or(CssomError::NotFound)?;

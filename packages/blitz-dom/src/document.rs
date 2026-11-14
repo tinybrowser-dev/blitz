@@ -1888,6 +1888,7 @@ impl BaseDocument {
                 origin_clean,
                 live: true,
                 owner: Some(node_id),
+                constructable: false,
             },
         );
         id
