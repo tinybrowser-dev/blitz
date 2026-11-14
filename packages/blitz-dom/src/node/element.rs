@@ -1106,7 +1106,7 @@ impl ElementData {
         let mut parser = Parser::new(value);
         let Ok(_) = PropertyDeclaration::parse_into(
             &mut source_property_declaration,
-            property_id,
+            property_id.clone(),
             &mut context,
             &mut parser,
         ) else {
@@ -1120,9 +1120,19 @@ impl ElementData {
         } else {
             Importance::Normal
         };
-        self.mutable_style_attribute(guard)
-            .write_with(&mut guard.write())
-            .extend(source_property_declaration.drain(), importance);
+        // CSSOM's "set a CSS declaration value" replaces the existing
+        // declaration together with its priority, so a later non-important
+        // value clears an `!important` one. Parsing a block keeps the
+        // important declaration instead, which is what
+        // `PropertyDeclarationBlock::push` assumes
+        // (<https://drafts.csswg.org/cssom/#set-a-css-declaration>).
+        let block = self.mutable_style_attribute(guard);
+        let mut write_guard = guard.write();
+        let block = block.write_with(&mut write_guard);
+        while let Some(index) = block.first_declaration_to_remove(&property_id) {
+            block.remove_property(&property_id, index);
+        }
+        block.extend(source_property_declaration.drain(), importance);
 
         true
     }

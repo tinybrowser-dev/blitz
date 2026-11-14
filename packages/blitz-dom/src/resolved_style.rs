@@ -146,7 +146,9 @@ pub fn parse_transform_matrix(value: &str) -> Option<([f64; 16], bool)> {
 
 /// The names of the properties exposed by the `CSSStyleDeclaration` returned
 /// from `getComputedStyle()` (its indexed properties): every enabled longhand,
-/// sorted alphabetically.
+/// standard properties before vendor-prefixed ones and each group in
+/// lexicographical order
+/// (<https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle>).
 pub fn resolved_style_property_names() -> &'static [&'static str] {
     static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
@@ -155,7 +157,16 @@ pub fn resolved_style_property_names() -> &'static [&'static str] {
             .map(|longhand| longhand.name())
             .filter(|name| PropertyId::parse_enabled_for_all_content(name).is_ok())
             .collect();
-        names.sort_unstable();
+        // A vendor-prefixed property is still a supported CSS property, but
+        // browsers enumerate the standard set first; a plain lexicographical
+        // sort would put `-webkit-…` before `align-content` because `-` sorts
+        // before letters
+        // (<https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle>).
+        names.sort_unstable_by(|left, right| {
+            left.starts_with('-')
+                .cmp(&right.starts_with('-'))
+                .then_with(|| left.cmp(right))
+        });
         names
     })
 }
