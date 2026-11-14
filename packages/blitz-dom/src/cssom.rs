@@ -22,7 +22,7 @@ use style::selector_parser::SelectorParser;
 use style::servo_arc::Arc as ServoArc;
 use style::shared_lock::{Locked, SharedRwLockReadGuard, ToCssWithGuard};
 use style::stylesheets::import_rule::ImportSheet;
-use style::stylesheets::keyframes_rule::{Keyframe, KeyframesRule};
+use style::stylesheets::keyframes_rule::{Keyframe, KeyframeSelectors, KeyframesRule};
 use style::stylesheets::{
     AllowImportRules, CssRule, CssRuleRef, CssRuleType, CssRuleTypes, CssRules, DocumentStyleSheet,
     Origin, OriginSet, RulesMutateError, StylesheetInDocument,
@@ -1108,6 +1108,58 @@ impl BaseDocument {
             self.stylist.rule_changed(
                 &sheet,
                 &rule,
+                &guard,
+                RuleChangeKind::Generic,
+                &ancestor_refs,
+            );
+        }
+        Ok(())
+    }
+
+    /// Replaces a keyframe's selector list (`CSSKeyframeRule.keyText`
+    /// setter). An unparsable selector list is a `SyntaxError` for the caller,
+    /// so the returned error is `CssomError::Syntax`.
+    ///
+    /// <https://drafts.csswg.org/css-animations-1/#dom-csskeyframerule-keytext>
+    pub fn cssom_rule_set_key_text(
+        &mut self,
+        sheet_id: u64,
+        path: &[usize],
+        text: &str,
+    ) -> Result<(), CssomError> {
+        let record = self
+            .cssom_sheets
+            .get(&sheet_id)
+            .ok_or(CssomError::NotFound)?;
+        let live = record.live;
+        let sheet = record.sheet.clone();
+        let lock = &self.guard;
+        let (ancestors, changed_rule, keyframe) = {
+            let guard = lock.read();
+            let mut ancestors = Vec::with_capacity(path.len());
+            let handle =
+                Self::resolve_rule(&sheet, &guard, path, |rule| ancestors.push(rule.clone()))
+                    .ok_or(CssomError::NotFound)?;
+            let RuleHandle::Keyframe(keyframe) = handle else {
+                return Err(CssomError::NotSupported);
+            };
+            // The owning `@keyframes` rule is the rule to report as changed.
+            let changed_rule = ancestors.pop().ok_or(CssomError::NotFound)?;
+            (ancestors, changed_rule, keyframe)
+        };
+        let selectors = Parser::new(text)
+            .parse_entirely(KeyframeSelectors::parse)
+            .map_err(|_| CssomError::Syntax)?;
+        {
+            let mut guard = lock.write();
+            keyframe.write_with(&mut guard).selector = selectors;
+        }
+        let guard = lock.read();
+        if live {
+            let ancestor_refs: Vec<CssRuleRef> = ancestors.iter().map(CssRuleRef::from).collect();
+            self.stylist.rule_changed(
+                &sheet,
+                &changed_rule,
                 &guard,
                 RuleChangeKind::Generic,
                 &ancestor_refs,
