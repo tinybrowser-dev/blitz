@@ -657,7 +657,36 @@ impl BaseDocument {
                             return format_used_px(used);
                         }
                     }
-                    // `static` and `sticky` boxes resolve to the computed value
+                    // A sticky box's inset percentages resolve against its
+                    // nearest scrollport, which is why they are not preserved
+                    // as computed values; an `auto` inset stays `auto` because
+                    // a sticky box's static position is not an inset
+                    // (<https://drafts.csswg.org/css-position-3/#sticky-pos>).
+                    Position::Sticky => {
+                        let (scrollport_width, scrollport_height) =
+                            self.scrollport_content_size(node_id);
+                        let pos_styles = styles.get_position();
+                        let (inset, basis) = match property_name {
+                            "top" => (&pos_styles.top, scrollport_height),
+                            "bottom" => (&pos_styles.bottom, scrollport_height),
+                            "left" => (&pos_styles.left, scrollport_width),
+                            "right" => (&pos_styles.right, scrollport_width),
+                            _ => unreachable!(),
+                        };
+                        match inset {
+                            GenericInset::Auto => return "auto".to_string(),
+                            GenericInset::LengthPercentage(value) => {
+                                return format_used_px(
+                                    value.resolve(CSSPixelLength::new(basis)).px(),
+                                );
+                            }
+                            // An `anchor()`/`anchor-size()` inset keeps its
+                            // computed value: anchor positioning is not
+                            // implemented.
+                            _ => {}
+                        }
+                    }
+                    // A `static` box resolves to the computed value.
                     _ => {}
                 }
             }
@@ -843,6 +872,48 @@ impl BaseDocument {
             return matches!(display.inside(), DisplayInside::Flex | DisplayInside::Grid);
         }
         false
+    }
+
+    /// The content-box size of the scrollport `node_id`'s sticky offsets resolve
+    /// against: the nearest ancestor that establishes a scrolling box, or the
+    /// viewport when no ancestor does. The root element's overflow belongs to
+    /// the viewport, so the walk stops there
+    /// (<https://drafts.csswg.org/css-position-3/#sticky-pos>).
+    fn scrollport_content_size(&self, node_id: NodeId) -> (f32, f32) {
+        let root = self.try_root_element().map(|root| root.id);
+        let mut ancestor = self.get_node(node_id).and_then(|node| node.parent);
+        while let Some(id) = ancestor {
+            // The root element's own overflow scrolls the viewport, whose box
+            // is not a layout box
+            if Some(id) == root {
+                break;
+            }
+            let Some(node) = self.get_node(id) else { break };
+            if crate::scrolling::establishes_scrolling_box(node) {
+                let layout = node.final_layout();
+                return (
+                    (layout.size.width
+                        - layout.border.left
+                        - layout.border.right
+                        - layout.padding.left
+                        - layout.padding.right)
+                        .max(0.0),
+                    (layout.size.height
+                        - layout.border.top
+                        - layout.border.bottom
+                        - layout.padding.top
+                        - layout.padding.bottom)
+                        .max(0.0),
+                );
+            }
+            ancestor = node.parent;
+        }
+        let viewport = self.viewport();
+        let scale = viewport.scale();
+        (
+            viewport.window_size.0 as f32 / scale,
+            viewport.window_size.1 as f32 / scale,
+        )
     }
 }
 

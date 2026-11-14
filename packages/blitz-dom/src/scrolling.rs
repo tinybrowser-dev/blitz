@@ -60,7 +60,7 @@ fn scrollable_overflow(overflow: Overflow) -> bool {
 
 /// Whether a node establishes a scrolling box of its own. The root element's
 /// overflow belongs to the viewport, so the caller handles it separately.
-fn establishes_scrolling_box(node: &crate::Node) -> bool {
+pub(crate) fn establishes_scrolling_box(node: &crate::Node) -> bool {
     if !node.has_boxes() || node.is_non_atomic_inline() {
         return false;
     }
