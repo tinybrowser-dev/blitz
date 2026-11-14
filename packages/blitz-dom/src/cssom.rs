@@ -21,6 +21,7 @@ use style::properties::{
 use style::selector_parser::SelectorParser;
 use style::servo_arc::Arc as ServoArc;
 use style::shared_lock::{Locked, SharedRwLockReadGuard, ToCssWithGuard};
+use style::stylesheets::import_rule::ImportSheet;
 use style::stylesheets::keyframes_rule::{Keyframe, KeyframesRule};
 use style::stylesheets::{
     AllowImportRules, CssRule, CssRuleRef, CssRuleType, CssRuleTypes, CssRules, DocumentStyleSheet,
@@ -232,12 +233,19 @@ fn rule_attributes(rule: &CssRule, guard: &SharedRwLockReadGuard) -> Vec<(&'stat
                         .map(|m| m.to_css_string())
                         .unwrap_or_default(),
                 ),
+                (
+                    "supportsText",
+                    r.supports
+                        .as_ref()
+                        .map(|supports| supports.condition.to_css_string())
+                        .unwrap_or_default(),
+                ),
             ]
         }
-        CssRule::Media(r) => vec![(
-            "conditionText",
-            r.media_queries.read_with(guard).to_css_string(),
-        )],
+        CssRule::Media(r) => {
+            let media = r.media_queries.read_with(guard).to_css_string();
+            vec![("conditionText", media.clone()), ("media", media)]
+        }
         CssRule::Supports(r) => vec![("conditionText", r.condition.to_css_string())],
         CssRule::Container(r) => vec![("conditionText", r.conditions.to_css_string())],
         CssRule::Page(r) => vec![("selectorText", r.read_with(guard).selectors.to_css_string())],
@@ -1096,6 +1104,80 @@ impl BaseDocument {
         let guard = lock.read();
         if live {
             let rule = CssRule::Style(style_rule);
+            let ancestor_refs: Vec<CssRuleRef> = ancestors.iter().map(CssRuleRef::from).collect();
+            self.stylist.rule_changed(
+                &sheet,
+                &rule,
+                &guard,
+                RuleChangeKind::Generic,
+                &ancestor_refs,
+            );
+        }
+        Ok(())
+    }
+
+    /// Replaces the media query list of a `@media` or `@import` rule
+    /// (`MediaList.mediaText` setter reached through the rule's
+    /// `[SameObject]` `media` attribute).
+    ///
+    /// <https://drafts.csswg.org/cssom/#dom-medialist-mediatext>
+    pub fn cssom_rule_set_media(
+        &mut self,
+        sheet_id: u64,
+        path: &[usize],
+        text: &str,
+    ) -> Result<(), CssomError> {
+        let record = self
+            .cssom_sheets
+            .get(&sheet_id)
+            .ok_or(CssomError::NotFound)?;
+        let live = record.live;
+        let sheet = record.sheet.clone();
+        let lock = &self.guard;
+        let (ancestors, rule, media) = {
+            let guard = lock.read();
+            let mut ancestors = Vec::with_capacity(path.len());
+            let handle =
+                Self::resolve_rule(&sheet, &guard, path, |rule| ancestors.push(rule.clone()))
+                    .ok_or(CssomError::NotFound)?;
+            let RuleHandle::Rule(rule) = handle else {
+                return Err(CssomError::NotSupported);
+            };
+            let media = match &rule {
+                CssRule::Media(media_rule) => Some(media_rule.media_queries.clone()),
+                CssRule::Import(import_rule) => match &import_rule.read_with(&guard).stylesheet {
+                    ImportSheet::Sheet(imported) => Some(imported.media.clone()),
+                    ImportSheet::Pending | ImportSheet::Refused => None,
+                },
+                _ => return Err(CssomError::NotSupported),
+            };
+            (ancestors, rule, media)
+        };
+        let Some(media) = media else {
+            return Err(CssomError::NotSupported);
+        };
+        let list = {
+            let url_data = self.url.url_extra_data();
+            let mut context = ParserContext::new(
+                Origin::Author,
+                &url_data,
+                None,
+                ParsingMode::DEFAULT,
+                QuirksMode::NoQuirks,
+                Default::default(),
+                None,
+                None,
+                Default::default(),
+            );
+            let mut parser = Parser::new(text);
+            style::media_queries::MediaList::parse(&mut context, &mut parser)
+        };
+        {
+            let mut guard = lock.write();
+            *media.write_with(&mut guard) = list;
+        }
+        let guard = lock.read();
+        if live {
             let ancestor_refs: Vec<CssRuleRef> = ancestors.iter().map(CssRuleRef::from).collect();
             self.stylist.rule_changed(
                 &sheet,
