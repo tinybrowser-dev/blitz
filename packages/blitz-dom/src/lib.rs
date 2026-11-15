@@ -36,6 +36,9 @@ pub const BULLET_FONT: &[u8] = include_bytes!("../assets/moz-bullet-font.otf");
 /// This is the primary entry point for this crate.
 mod document;
 
+/// The CSS animation and transition lifecycle events a resolve observes.
+pub mod animation_events;
+
 /// The nodes themsleves, and their data.
 pub mod node;
 

@@ -415,6 +415,10 @@ pub struct BaseDocument {
     /// The scrolling boxes whose scroll operation completed since the last
     /// scroll steps, in order
     pub(crate) pending_scrollends: Vec<crate::scrolling::ScrollEventTarget>,
+    /// The CSS animation and transition lifecycle changes the last resolve
+    /// observed, waiting for the embedder to fire them in the document's
+    /// realm (<https://drafts.csswg.org/css-animations-1/#events>).
+    pub(crate) pending_animation_events: Vec<crate::animation_events::PendingAnimationEvent>,
     /// The document's animation timeline in milliseconds, sampled at the start
     /// of every [`BaseDocument::resolve`] from the embedder's clock. A smooth
     /// scroll advances on it, so it follows the same clock as frames and timers
@@ -897,6 +901,7 @@ impl BaseDocument {
             scroll_animations: ScrollAnimations::default(),
             pending_scrolls: Vec::new(),
             pending_scrollends: Vec::new(),
+            pending_animation_events: Vec::new(),
             animation_time_ms: 0.0,
             text_selection: TextSelection::default(),
         };
@@ -3215,8 +3220,7 @@ impl BaseDocument {
             .and_then(|el| el.sub_doc_data_mut())
     }
 
-    pub fn is_animating(&self) -> bool {
-        #[cfg(feature = "custom-widget")]
+    pub fn is_animating(&self) -> bool {        #[cfg(feature = "custom-widget")]
         let custom_widget_is_animating = self.custom_widget_nodes.iter().any(|&node_id| {
             self.nodes[node_id]
                 .element_data()
@@ -3232,6 +3236,30 @@ impl BaseDocument {
             | custom_widget_is_animating
             | self.scroll_animations.is_animating()
             | self.scrollbars_animating()
+    }
+
+    /// Whether a CSS animation or transition is still ticking and can reach
+    /// its end, so the embedder owes the document a rendering opportunity each
+    /// frame until it settles. An infinite animation never settles, so it is
+    /// excluded: a host that treated it as pending work would never reach
+    /// quiescence, and a page that wants frames for it asks with
+    /// `requestAnimationFrame`. Unlike [`Self::is_animating`] this also
+    /// excludes a canvas and a subdocument, which do not need a style resolve
+    /// to advance (<https://drafts.csswg.org/css-animations-1/#events>).
+    pub fn has_finishing_css_animations(&self) -> bool {
+        if !self.has_active_animations {
+            return false;
+        }
+        let sets = self.animations.sets.read();
+        sets.values().any(|set| {
+            !set.transitions.is_empty()
+                || set.animations.iter().any(|animation| {
+                    matches!(
+                        animation.iteration_state,
+                        style::animation::KeyframesIterationState::Finite(_, _)
+                    )
+                })
+        })
     }
 
     /// Record pending [`DeviceChanges`] and request a redraw so that they are

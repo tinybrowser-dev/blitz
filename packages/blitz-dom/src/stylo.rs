@@ -21,6 +21,9 @@ use selectors::{
 use style::CaseSensitivityExt;
 use style::animation::AnimationSetKey;
 use style::animation::AnimationState;
+use style::animation::KeyframesIterationState;
+use style_traits::ToCss as _;
+use crate::animation_events::{AnimationEventKind, PendingAnimationEvent};
 use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::bloom::each_relevant_element_hash;
 use style::color::AbsoluteColor;
@@ -109,23 +112,90 @@ impl crate::document::BaseDocument {
 
             self.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_SELF);
 
+            let pseudo_element = pseudo_element_css(key.pseudo_element.as_ref());
             for animation in set.animations.iter_mut() {
                 if animation.state == AnimationState::Pending && animation.started_at <= now {
                     animation.state = AnimationState::Running;
+                    // The delay is excluded from `elapsedTime` unless it is
+                    // negative, in which case the animation begins partway
+                    // through its active interval
+                    // (<https://drafts.csswg.org/css-animations-1/#dom-animationevent-elapsedtime>).
+                    self.pending_animation_events
+                        .push(PendingAnimationEvent {
+                            target: node_id,
+                            kind: AnimationEventKind::AnimationStart,
+                            name: animation.name.to_string(),
+                            pseudo_element: pseudo_element.clone(),
+                            elapsed_time: (now - animation.started_at).max(0.0),
+                        });
                 }
-                animation.iterate_if_necessary(now);
+                if animation.iterate_if_necessary(now) {
+                    // The event reports the time at which the completed
+                    // iteration ended, counted from the start of the active
+                    // interval
+                    // (<https://drafts.csswg.org/css-animations-1/#eventdef-animationevent-animationiteration>).
+                    let iterations = match animation.iteration_state {
+                        KeyframesIterationState::Infinite(current) => current,
+                        KeyframesIterationState::Finite(current, _) => current,
+                    };
+                    self.pending_animation_events
+                        .push(PendingAnimationEvent {
+                            target: node_id,
+                            kind: AnimationEventKind::AnimationIteration,
+                            name: animation.name.to_string(),
+                            pseudo_element: pseudo_element.clone(),
+                            elapsed_time: iterations * animation.duration,
+                        });
+                }
 
                 if animation.state == AnimationState::Running && animation.has_ended(now) {
                     animation.state = AnimationState::Finished;
+                    // The end of the last iteration reports the animation's
+                    // active duration
+                    // (<https://drafts.csswg.org/css-animations-1/#eventdef-animationevent-animationend>).
+                    let iterations = match animation.iteration_state {
+                        KeyframesIterationState::Infinite(_) => 1.0,
+                        KeyframesIterationState::Finite(_, max) => max,
+                    };
+                    self.pending_animation_events
+                        .push(PendingAnimationEvent {
+                            target: node_id,
+                            kind: AnimationEventKind::AnimationEnd,
+                            name: animation.name.to_string(),
+                            pseudo_element: pseudo_element.clone(),
+                            elapsed_time: iterations * animation.duration,
+                        });
                 }
             }
 
             for transition in set.transitions.iter_mut() {
                 if transition.state == AnimationState::Pending && transition.start_time <= now {
                     transition.state = AnimationState::Running;
+                    self.pending_animation_events
+                        .push(PendingAnimationEvent {
+                            target: node_id,
+                            kind: AnimationEventKind::TransitionStart,
+                            name: transition
+                                .property_animation
+                                .property_id()
+                                .to_css_string(),
+                            pseudo_element: pseudo_element.clone(),
+                            elapsed_time: 0.0,
+                        });
                 }
                 if transition.state == AnimationState::Running && transition.has_ended(now) {
                     transition.state = AnimationState::Finished;
+                    self.pending_animation_events
+                        .push(PendingAnimationEvent {
+                            target: node_id,
+                            kind: AnimationEventKind::TransitionEnd,
+                            name: transition
+                                .property_animation
+                                .property_id()
+                                .to_css_string(),
+                            pseudo_element: pseudo_element.clone(),
+                            elapsed_time: transition.property_animation.duration,
+                        });
                 }
             }
         }
@@ -178,7 +248,52 @@ impl crate::document::BaseDocument {
         self.snapshots.clear();
 
         let mut sets = self.animations.sets.write();
-        for set in sets.values_mut() {
+        for (key, set) in sets.iter_mut() {
+            let node_id = NodeId::from_u64(key.node.id() as u64);
+            let pseudo_element = pseudo_element_css(key.pseudo_element.as_ref());
+            // A transition that appeared during this traversal starts now: the
+            // tick above runs before style computation, so the creation is
+            // still marked new here
+            // (<https://drafts.csswg.org/css-transitions-1/#eventdef-transitionevent-transitionrun>).
+            for transition in &set.transitions {
+                if transition.is_new {
+                    self.pending_animation_events
+                        .push(PendingAnimationEvent {
+                            target: node_id,
+                            kind: AnimationEventKind::TransitionRun,
+                            name: transition.property_animation.property_id().to_css_string(),
+                            pseudo_element: pseudo_element.clone(),
+                            elapsed_time: 0.0,
+                        });
+                }
+            }
+            // A cancellation is recorded by the style change above and removed
+            // below, so this is the last chance to report it
+            // (<https://drafts.csswg.org/css-animations-2/#eventdef-animationevent-animationcancel>).
+            for animation in &set.animations {
+                if animation.state == AnimationState::Canceled {
+                    self.pending_animation_events
+                        .push(PendingAnimationEvent {
+                            target: node_id,
+                            kind: AnimationEventKind::AnimationCancel,
+                            name: animation.name.to_string(),
+                            pseudo_element: pseudo_element.clone(),
+                            elapsed_time: (now - animation.started_at).max(0.0),
+                        });
+                }
+            }
+            for transition in &set.transitions {
+                if transition.state == AnimationState::Canceled {
+                    self.pending_animation_events
+                        .push(PendingAnimationEvent {
+                            target: node_id,
+                            kind: AnimationEventKind::TransitionCancel,
+                            name: transition.property_animation.property_id().to_css_string(),
+                            pseudo_element: pseudo_element.clone(),
+                            elapsed_time: (now - transition.start_time).max(0.0),
+                        });
+                }
+            }
             set.clear_canceled_animations();
             for animation in set.animations.iter_mut() {
                 animation.is_new = false;
@@ -1789,6 +1904,21 @@ fn assert_size_of_equals() {
 
     // let size = mem::size_of::<StyleSharingCandidate<BlitzNode>>();
     // dbg!(size);
+}
+
+/// The `pseudoElement` a lifecycle event reports for an animation set key: an
+/// empty string for the element itself, else the pseudo-element's CSS
+/// selector
+/// (<https://drafts.csswg.org/css-animations-1/#dom-animationevent-pseudoelement>).
+fn pseudo_element_css(pseudo: Option<&PseudoElement>) -> String {
+    let Some(pseudo) = pseudo else {
+        return String::new();
+    };
+    let mut css = String::new();
+    // `PseudoElement` implements `cssparser::ToCss`, whose `to_css_string`
+    // helper the `style_traits` trait does not provide for a foreign type.
+    cssparser::ToCss::to_css(pseudo, &mut css).expect("writing to a String cannot fail");
+    css
 }
 
 #[test]
