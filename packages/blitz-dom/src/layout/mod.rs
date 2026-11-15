@@ -500,6 +500,29 @@ impl LayoutPassState<'_> {
                         }
                     };
 
+                    // A replaced element's intrinsic size is a physical length, so
+                    // `zoom` scales it like any other used length; a `width: auto`
+                    // image inside a `zoom: 4` box is four times its intrinsic size
+                    // (<https://drafts.csswg.org/css-viewport/#propdef-zoom>).
+                    let zoom = node
+                        .primary_styles()
+                        .map_or(1.0, |style| style.effective_zoom.value());
+                    let (intrinsic_sizes, default_object_size) = if zoom == 1.0 {
+                        (intrinsic_sizes, default_object_size)
+                    } else {
+                        (
+                            IntrinsicSizes {
+                                width: intrinsic_sizes.width.map(|width| width * zoom),
+                                height: intrinsic_sizes.height.map(|height| height * zoom),
+                                ratio: intrinsic_sizes.ratio,
+                            },
+                            taffy::Size {
+                                width: default_object_size.width * zoom,
+                                height: default_object_size.height * zoom,
+                            },
+                        )
+                    };
+
                     #[cfg(feature = "writing-mode")]
                     let (intrinsic_sizes, default_object_size) =
                         if node.writing_mode().is_vertical() {
