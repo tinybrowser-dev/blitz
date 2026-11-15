@@ -612,6 +612,11 @@ impl ElementData {
                     false => ElementState::ENABLED,
                 });
         }
+        // `:required`, `:optional`, `:read-write`, and `:read-only` follow the
+        // attributes the element was built with, including the `disabled` bit
+        // just set
+        // (<https://html.spec.whatwg.org/multipage/semantics-other.html#selector-required>).
+        data.sync_form_selector_state();
 
         // A newly built control has no child text yet.
         data.sync_placeholder_shown(true);
@@ -680,6 +685,102 @@ impl ElementData {
     pub fn is_link(&self) -> bool {
         (self.name.local == local_name!("a") || self.name.local == local_name!("area"))
             && self.has_attr(local_name!("href"))
+    }
+
+    /// Whether the `required` attribute applies to this element: a `select`, a
+    /// `textarea`, or an `input` whose type is in a state that supports it.
+    ///
+    /// The states that do not support it are the ones the input type table
+    /// marks "does not apply", and an unknown or missing keyword is the Text
+    /// state, which does
+    /// (<https://html.spec.whatwg.org/multipage/input.html#attr-input-required>).
+    fn supports_required(&self) -> bool {
+        match self.name.local.as_ref() {
+            "select" | "textarea" => true,
+            "input" => !matches!(
+                self.input_type_keyword().as_str(),
+                "hidden" | "range" | "color" | "button" | "submit" | "reset" | "image"
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether the `readonly` attribute applies to this element, which is the
+    /// same test `:read-write` uses for its form-control half: a `textarea`, or
+    /// an `input` in one of the text-like states
+    /// (<https://html.spec.whatwg.org/multipage/semantics-other.html#selector-read-write>).
+    fn supports_readonly(&self) -> bool {
+        match self.name.local.as_ref() {
+            "textarea" => true,
+            "input" => matches!(
+                self.input_type_keyword().as_str(),
+                "text"
+                    | "search"
+                    | "url"
+                    | "tel"
+                    | "email"
+                    | "password"
+                    | "date"
+                    | "month"
+                    | "week"
+                    | "time"
+                    | "datetime-local"
+                    | "number"
+            ),
+            _ => false,
+        }
+    }
+
+    /// The `type` attribute's keyword, ASCII-lowercased and trimmed, with a
+    /// missing attribute reading as `text`. An unknown keyword is also the
+    /// Text state, but keeping the raw keyword lets the required/readonly
+    /// tables see it as unknown rather than as text
+    /// (<https://html.spec.whatwg.org/multipage/input.html#attr-input-type>).
+    fn input_type_keyword(&self) -> String {
+        self.attr(local_name!("type"))
+            .unwrap_or("text")
+            .trim()
+            .to_ascii_lowercase()
+    }
+
+    /// Whether this element is an editing host: a `contenteditable` attribute
+    /// in the true or plaintext-only state
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#editing-host>).
+    fn is_editing_host(&self) -> bool {
+        self.attr(local_name!("contenteditable"))
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "" | "true" | "plaintext-only"
+                )
+            })
+    }
+
+    /// Keep the form pseudo-class bits that style sharing keys on aligned with
+    /// the element's attributes: `:required`, `:optional`, `:read-write`, and
+    /// `:read-only`.
+    ///
+    /// `:required` matches a control that can be required and carries the
+    /// attribute, `:optional` a control that can be required without it, and
+    /// `:read-write` a mutable text control or an editing host. `:read-only`
+    /// matches everything that is not `:read-write`.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/semantics-other.html#selector-required>
+    /// <https://html.spec.whatwg.org/multipage/semantics-other.html#selector-read-write>
+    pub fn sync_form_selector_state(&mut self) {
+        let required_applies = self.supports_required();
+        let required = required_applies && self.has_attr(local_name!("required"));
+        self.element_state.set(ElementState::REQUIRED, required);
+        self.element_state
+            .set(ElementState::OPTIONAL_, required_applies && !required);
+        // A disabled control is not mutable, and neither is one that carries
+        // the `readonly` attribute
+        // (<https://html.spec.whatwg.org/multipage/semantics-other.html#selector-read-write>).
+        let mutable = !self.element_state.contains(ElementState::DISABLED)
+            && !self.has_attr(local_name!("readonly"));
+        let read_write = (self.supports_readonly() && mutable) || self.is_editing_host();
+        self.element_state.set(ElementState::READWRITE, read_write);
+        self.element_state.set(ElementState::READONLY, !read_write);
     }
 
     /// Keep [`ElementState::PLACEHOLDER_SHOWN`] aligned with whether this

@@ -560,6 +560,21 @@ impl DocumentMutator<'_> {
         if no_namespace && refresh_placeholder && name.local != local_name!("value") {
             element.sync_placeholder_shown(textarea_text_empty);
         }
+        // `:required`, `:optional`, `:read-write`, and `:read-only` come from
+        // these attributes
+        // (<https://html.spec.whatwg.org/multipage/semantics-other.html#selector-required>).
+        if no_namespace
+            && matches!(
+                name.local,
+                ref local
+                    if local == &local_name!("required")
+                        || local == &local_name!("readonly")
+                        || local == &local_name!("type")
+                        || local == &local_name!("contenteditable")
+            )
+        {
+            element.sync_form_selector_state();
+        }
 
         if node_is_in_document {
             devtools!(
@@ -806,6 +821,19 @@ impl DocumentMutator<'_> {
 
         if name.local == local_name!("class") {
             element.classes.clear();
+        }
+
+        // The form pseudo-class bits follow the attributes that feed them
+        // (<https://html.spec.whatwg.org/multipage/semantics-other.html#selector-required>).
+        if matches!(
+            name.local,
+            ref local
+                if local == &local_name!("required")
+                    || local == &local_name!("readonly")
+                    || local == &local_name!("type")
+                    || local == &local_name!("contenteditable")
+        ) {
+            element.sync_form_selector_state();
         }
 
         // As in `set_attribute`: taking one of these away can make the element

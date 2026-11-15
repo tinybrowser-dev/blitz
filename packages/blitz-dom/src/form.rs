@@ -419,6 +419,10 @@ impl BaseDocument {
             };
             element.element_state.set(ElementState::DISABLED, disabled);
             element.element_state.set(ElementState::ENABLED, !disabled);
+            // A disabled control is not mutable, so `:read-write` and
+            // `:read-only` follow the bits
+            // (<https://html.spec.whatwg.org/multipage/semantics-other.html#selector-read-write>).
+            element.sync_form_selector_state();
         }
     }
 

@@ -695,8 +695,12 @@ impl selectors::Element for BlitzNode<'_> {
             NonTSPseudoClass::PlaceholderShown => self
                 .element_state()
                 .contains(ElementState::PLACEHOLDER_SHOWN),
-            NonTSPseudoClass::ReadWrite => false,
-            NonTSPseudoClass::ReadOnly => false,
+            // The bits are maintained by `ElementData::sync_form_selector_state`
+            // <https://html.spec.whatwg.org/multipage/semantics-other.html#selector-read-write>
+            NonTSPseudoClass::ReadWrite => {
+                self.element_state().contains(ElementState::READWRITE)
+            }
+            NonTSPseudoClass::ReadOnly => self.element_state().contains(ElementState::READONLY),
             NonTSPseudoClass::ServoNonZeroBorder => false,
             // The document sets the bit on the element its URL fragment names
             // (`BaseDocument::set_url_target`)
@@ -710,10 +714,12 @@ impl selectors::Element for BlitzNode<'_> {
             NonTSPseudoClass::Modal => false,
             NonTSPseudoClass::MozInert => self.element_state().contains(ElementState::INERT),
             NonTSPseudoClass::Open => self.element_state().contains(ElementState::OPEN),
-            NonTSPseudoClass::Optional => false,
+            // The bits are maintained by `ElementData::sync_form_selector_state`
+            // <https://html.spec.whatwg.org/multipage/semantics-other.html#selector-required>
+            NonTSPseudoClass::Optional => self.element_state().contains(ElementState::OPTIONAL_),
             NonTSPseudoClass::OutOfRange => false,
             NonTSPseudoClass::PopoverOpen => false,
-            NonTSPseudoClass::Required => false,
+            NonTSPseudoClass::Required => self.element_state().contains(ElementState::REQUIRED),
             NonTSPseudoClass::UserInvalid => false,
             NonTSPseudoClass::UserValid => false,
             NonTSPseudoClass::MozMeterOptimum => false,
