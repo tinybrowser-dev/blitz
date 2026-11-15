@@ -1059,6 +1059,54 @@ impl TextNodeData {
 //     state: Cell<ElementState>,
 // }
 
+/// Where a hit test's results go.
+///
+/// The pointer-target query wants the topmost box under the point;
+/// `elementsFromPoint` wants every painted box under it, topmost first.
+/// Both are the same paint-order descent, so the collector decides when the
+/// walk has enough
+/// (<https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint>).
+pub(crate) struct HitCollector {
+    hits: Vec<HitResult>,
+    /// Stop after the first hit, which is the topmost box.
+    first_only: bool,
+    /// The innermost overlay scrollbar thumb under the point, if any.
+    pub(crate) scrollbar: Option<crate::node::ScrollbarRef>,
+}
+
+impl HitCollector {
+    /// A collector for the topmost box only.
+    pub(crate) fn first() -> Self {
+        Self {
+            hits: Vec::new(),
+            first_only: true,
+            scrollbar: None,
+        }
+    }
+
+    /// A collector for every painted box under the point, topmost first.
+    pub(crate) fn all() -> Self {
+        Self {
+            hits: Vec::new(),
+            first_only: false,
+            scrollbar: None,
+        }
+    }
+
+    /// The collected boxes, topmost first.
+    pub(crate) fn into_hits(self) -> Vec<HitResult> {
+        self.hits
+    }
+
+    fn done(&self) -> bool {
+        self.first_only && !self.hits.is_empty()
+    }
+
+    fn push(&mut self, hit: HitResult) {
+        self.hits.push(hit);
+    }
+}
+
 impl Node {
     pub fn tree(&self) -> &crate::NodeTree {
         unsafe { &*self.tree }
@@ -1511,33 +1559,25 @@ impl Node {
             .any(|image| !matches!(image, GenericImage::None))
     }
 
-    /// Takes an (x, y) position (relative to the *parent's* top-left corner) and returns:
-    ///    - None if the position is outside of this node's bounds
-    ///    - Some(HitResult) if the position is within the node but doesn't match any children
-    ///    - The result of recursively calling child.hit() on the the child element that is
-    ///      positioned at that position if there is one.
+    /// Walks the box painted at this node's position, collecting the boxes under
+    /// an (x, y) point relative to this node's top-left corner into `collector`.
+    /// The walk follows paint order, so the topmost box is collected first, and
+    /// it stops early only when the collector asks for one hit.
     ///
     /// Hit testing may run between a DOM mutation and the next `resolve`, so the
     /// paint lists and inline layouts it walks can still name nodes the mutation
     /// dropped; those are skipped.
-    ///
-    /// TODO: z-index
-    /// (If multiple children are positioned at the position then a random one will be recursed into)
     pub fn hit(&self, x: f32, y: f32, scale: f64) -> Option<HitResult> {
-        self.hit_inner(x, y, scale, &mut None)
+        let mut collector = HitCollector::first();
+        self.hit_inner(x, y, scale, &mut collector);
+        collector.into_hits().pop()
     }
 
-    /// [`hit`](Self::hit), also resolving the innermost overlay scrollbar
-    /// thumb under the point into `scrollbar` during the same descent (so
-    /// thumb hit-testing shares the exact coordinate handling — transforms
-    /// included — of every other hit test).
-    pub(crate) fn hit_inner(
-        &self,
-        x: f32,
-        y: f32,
-        scale: f64,
-        scrollbar: &mut Option<crate::node::ScrollbarRef>,
-    ) -> Option<HitResult> {
+    /// [`hit`](Self::hit), walking the whole paint order and also resolving the
+    /// innermost overlay scrollbar thumb under the point (so thumb hit-testing
+    /// shares the exact coordinate handling — transforms included — of every
+    /// other hit test).
+    pub(crate) fn hit_inner(&self, x: f32, y: f32, scale: f64, collector: &mut HitCollector) {
         use style::computed_values::pointer_events::T as PointerEvents;
         use style::computed_values::visibility::T as Visibility;
 
@@ -1547,7 +1587,7 @@ impl Node {
                 style.clone_visibility(),
                 Visibility::Hidden | Visibility::Collapse
             ) {
-                return None;
+                return;
             }
         }
 
@@ -1626,18 +1666,25 @@ impl Node {
             && y <= (overflow.y1 / scale) as f32;
 
         if !matches_self && !matches_content && !matches_hoisted_content && !matches_overflow {
-            return None;
+            return;
         }
 
         // Descendants overwrite, so the innermost scroll container's thumb
         // wins. Thumb coords are border-box relative (unscrolled).
+        // A box with no area cannot receive a hit itself: a zero-height
+        // block's top edge still matches the inclusive bottom-edge test, so
+        // `elementFromPoint` would otherwise name a box that paints nothing
+        // (and, at the viewport origin, `head`).
+        let has_area = size.width > 0.0 && size.height > 0.0;
+
         if matches_self
+            && has_area
             && let Some(sb) = self.scrollbar_at_local(
                 (x - self.scroll_offset().x as f32) as f64,
                 (y - self.scroll_offset().y as f32) as f64,
             )
         {
-            *scrollbar = Some(sb);
+            collector.scrollbar = Some(sb);
         }
 
         // Text clusters and callers of the returned coordinates work in the
@@ -1665,14 +1712,15 @@ impl Node {
                     let pos = hoisted_child.position(self.tree(), self.id);
                     let x = x - pos.x;
                     let y = y - pos.y;
-                    if let Some(hit) = child.hit_inner(x, y, scale, scrollbar) {
-                        return Some(hit);
+                    child.hit_inner(x, y, scale, collector);
+                    if collector.done() {
+                        return;
                     }
                 }
             }
         }
 
-        // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
+        // Children in paint order, topmost first
         for child_id in self.paint_children.borrow().iter().flatten().rev() {
             let Some(child) = self.tree().get(*child_id) else {
                 continue;
@@ -1693,8 +1741,9 @@ impl Node {
                     child_y -= viewport_scroll.y as f32;
                 }
             }
-            if let Some(hit) = child.hit_inner(child_x, child_y, scale, scrollbar) {
-                return Some(hit);
+            child.hit_inner(child_x, child_y, scale, collector);
+            if collector.done() {
+                return;
             }
         }
 
@@ -1708,8 +1757,9 @@ impl Node {
                     let pos = hoisted_child.position(self.tree(), self.id);
                     let x = x - pos.x;
                     let y = y - pos.y;
-                    if let Some(hit) = child.hit_inner(x, y, scale, scrollbar) {
-                        return Some(hit);
+                    child.hit_inner(x, y, scale, collector);
+                    if collector.done() {
+                        return;
                     }
                 }
             }
@@ -1734,28 +1784,29 @@ impl Node {
                             style.clone_pointer_events() == PointerEvents::None
                         })
                     {
-                        return Some(HitResult {
+                        collector.push(HitResult {
                             node_id,
                             x,
                             y,
                             is_text: true,
                         });
+                        if collector.done() {
+                            return;
+                        }
                     }
                 }
             }
         }
 
         // Self (this node)
-        if matches_self && !pointer_events_none {
-            return Some(HitResult {
+        if matches_self && has_area && !pointer_events_none {
+            collector.push(HitResult {
                 node_id: self.id,
                 x: x - content_box_offset.x,
                 y: y - content_box_offset.y,
                 is_text: false,
             });
         }
-
-        None
     }
 
     /// Find the inline root ancestor of this node (or self if this is an inline root).
