@@ -246,6 +246,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // scrollports narrow this rectangle further for their descendants.
         let viewport_clip_rect = Rect::new(0.0, 0.0, self.width as f64, self.height as f64);
 
+        let viewport_scroll = paint_scroll_offset(viewport_scroll);
         self.render_element(
             scene,
             root_id,
@@ -297,9 +298,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
     }
 
     fn scrolled_transform(&self, node: &Node, transform: Affine) -> Affine {
+        let scroll = paint_scroll_offset(*node.scroll_offset());
         transform.then_translate(Vec2 {
-            x: -node.scroll_offset().x * self.scale,
-            y: -node.scroll_offset().y * self.scale,
+            x: -scroll.x * self.scale,
+            y: -scroll.y * self.scale,
         })
     }
 
@@ -362,10 +364,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         if node.flags.is_inline_root() {
             if let Some(layout) = &cx.element.inline_layout_data {
                 let layout_box = node.final_layout();
-                let x = (layout_box.padding.left + layout_box.border.left) as f64
-                    - node.scroll_offset().x;
-                let y = (layout_box.padding.top + layout_box.border.top) as f64
-                    - node.scroll_offset().y
+                let scroll = paint_scroll_offset(*node.scroll_offset());
+                let x = (layout_box.padding.left + layout_box.border.left) as f64 - scroll.x;
+                let y = (layout_box.padding.top + layout_box.border.top) as f64 - scroll.y
                     + layout.block_offset as f64;
                 let text_transform =
                     transform * Affine::translate((x * self.scale, y * self.scale));
@@ -679,9 +680,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             None,
                             |scene| {
                                 // Now that background has been drawn, offset pos and cx in order to draw our contents scrolled
+                                let scroll = paint_scroll_offset(*node.scroll_offset());
                                 let content_position = Point {
-                                    x: content_position.x - node.scroll_offset().x,
-                                    y: content_position.y - node.scroll_offset().y,
+                                    x: content_position.x - scroll.x,
+                                    y: content_position.y - scroll.y,
                                 };
 
                                 cx.transform = self.scrolled_transform(node, cx.transform);
@@ -1202,7 +1204,8 @@ impl ElementCx<'_, '_> {
                 let child_transform = if child.taffy_position() == taffy::Position::Fixed
                     && Some(self.node.id) == self.context.root_element_id
                 {
-                    let scroll = self.context.dom.as_ref().viewport_scroll();
+                    let scroll =
+                        paint_scroll_offset(self.context.dom.as_ref().viewport_scroll());
                     parent_style_transform.pre_translate(kurbo::Vec2 {
                         x: scroll.x * self.scale,
                         y: scroll.y * self.scale,
@@ -1487,6 +1490,17 @@ fn root_has_background(node: &Node) -> bool {
         .any(|image| !matches!(image, style::values::generics::image::Image::None))
         || background.background_color
             != style::values::generics::color::GenericColor::TRANSPARENT_BLACK
+}
+
+/// A scroll offset as paint applies it, snapped to the layout grid.
+///
+/// Taffy's final layout positions are rounded to whole pixels while a scroll
+/// offset can be fractional (a fractional scroll, or a fractional `zoom` such
+/// as `zoom: 0.9`). Applying the unrounded offset would snap a scrollport's
+/// edge and its scrolled content to different places, leaving a seam of the
+/// scrollport's own background at its leading edge.
+fn paint_scroll_offset(scroll: blitz_dom::Point<f64>) -> Vec2 {
+    Vec2::new(scroll.x.round(), scroll.y.round())
 }
 
 /// Convert Stylo and Taffy types into Kurbo types

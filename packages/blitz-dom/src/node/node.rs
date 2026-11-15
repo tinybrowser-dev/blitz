@@ -2057,6 +2057,23 @@ impl Node {
         }))
     }
 
+    /// This node's layout in physical coordinates before pixel rounding.
+    ///
+    /// `unrounded_layout` is written in the writing mode of the box that placed
+    /// the node, so a vertical placer's coordinates are transposed and mirrored
+    /// (see `physicalise_and_round_layout`). Those nodes use the rounded
+    /// physical layout, which is already in physical coordinates.
+    fn physical_unrounded_layout(&self, node: &Node) -> taffy::Layout {
+        let vertical_placer = node.containing_block().is_some_and(|parent| {
+            self.with(parent).layout_data().writing_mode.is_vertical()
+        });
+        if vertical_placer {
+            *node.final_layout()
+        } else {
+            *node.unrounded_layout()
+        }
+    }
+
     /// CSSOM View's `offsetLeft`/`offsetTop`: the offset of this node's border box from the
     /// padding edge of its [`offset_parent`](Self::offset_parent).
     pub fn offset_top_left(&self) -> crate::util::Point<f32> {
@@ -2077,7 +2094,7 @@ impl Node {
                 return crate::util::Point { x, y };
             };
             if inline_root.is_offset_parent(static_element) && !inline_root.is_static_body() {
-                let border = inline_root.final_layout().border;
+                let border = self.physical_unrounded_layout(inline_root).border;
                 return crate::util::Point {
                     x: x - border.left,
                     y: y - border.top,
@@ -2086,8 +2103,11 @@ impl Node {
             current = inline_root;
         }
 
+        // The walk is unrounded: CSSOM View rounds the final offset, so a
+        // fractional position must survive until then (a `zoom: 0.5` box at
+        // y = 5.5 reports 11, not 12).
         loop {
-            let layout = current.final_layout();
+            let layout = self.physical_unrounded_layout(current);
             x += layout.location.x;
             y += layout.location.y;
 
@@ -2096,7 +2116,7 @@ impl Node {
             };
             let parent = self.with(parent_id);
             if parent.is_offset_parent(static_element) && !parent.is_static_body() {
-                let border = parent.final_layout().border;
+                let border = self.physical_unrounded_layout(parent).border;
                 let (mut border_x, mut border_y) = (border.left, border.top);
                 // A table with captions is the wrapper box, whose content starts
                 // at the first caption; the element's own layout is the grid
