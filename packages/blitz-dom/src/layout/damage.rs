@@ -120,6 +120,17 @@ impl BaseDocument {
             damage_for_parent.insert(CONSTRUCT_DESCENDENT);
         }
 
+        // A table collects its captions into its own box when it is built: the
+        // wrapper box orders them by `caption-side` and keeps their margin
+        // boxes. A caption whose layout changed must therefore rebuild the
+        // table box (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+        if !damage.is_empty()
+            && self.nodes[node_id].display_constructed_as().outside()
+                == DisplayOutside::TableCaption
+        {
+            damage_for_parent.insert(CONSTRUCT_BOX);
+        }
+
         // An inline `<svg>` is rendered from a snapshot of its subtree (with
         // `currentColor` resolved) taken during box construction, so it must be
         // rebuilt whenever the style of the `<svg>` or any descendant changes.

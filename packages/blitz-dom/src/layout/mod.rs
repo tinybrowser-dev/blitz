@@ -564,11 +564,25 @@ impl LayoutPassState<'_> {
                         doc: self,
                         ctx: context,
                     };
-                    let mut output = compute_grid_layout(&mut table_wrapper, node_id, inputs);
+                    let grid = compute_grid_layout(&mut table_wrapper, node_id, inputs);
+                    let context = table_wrapper.ctx;
+                    // With captions the element's box is the wrapper box around
+                    // the captions and the grid, so the parent reserves that
+                    // box; the grid is laid out again inside it.
+                    let mut output = if context.captions.is_empty() {
+                        grid
+                    } else {
+                        table::layout_table_with_captions(
+                            self,
+                            node_id,
+                            inputs,
+                            context.clone(),
+                            &grid,
+                        )
+                    };
 
                     // Absolutely positioned children take no part in the table grid. Their
-                    // static position is the top-left of the table's content box.
-                    let context = table_wrapper.ctx;
+                    // static position is the top-left of the grid's content box.
                     if inputs.run_mode == RunMode::PerformLayout && !context.oof_children.is_empty()
                     {
                         let style = &context.style;
@@ -695,7 +709,26 @@ impl LayoutPartialTree for LayoutPassState<'_> {
     }
 
     fn set_unrounded_layout(&mut self, node_id: NodeId, layout: &Layout) {
-        *self.node_from_id_mut(node_id).unrounded_layout_mut() = *layout;
+        let node = self.node_from_id_mut(node_id);
+        // A table with captions lays out as its wrapper box, which the parent
+        // positioned and sized; the element's own box is the grid inside it, so
+        // that borders, backgrounds and hit testing cover the table and not the
+        // captions (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+        if node.flags.is_table_root()
+            && let Some(grid) = node
+                .element_data()
+                .and_then(|element| element.table_root.as_ref())
+                .filter(|table| !table.captions.is_empty())
+                .and_then(|table| *table.grid_layout.borrow())
+        {
+            let mut grid = grid;
+            grid.order = layout.order;
+            grid.location.x += layout.location.x;
+            grid.location.y += layout.location.y;
+            *node.unrounded_layout_mut() = grid;
+            return;
+        }
+        *node.unrounded_layout_mut() = *layout;
     }
 
     fn resolve_calc_value(&self, calc_ptr: *const (), parent_size: f32) -> f32 {

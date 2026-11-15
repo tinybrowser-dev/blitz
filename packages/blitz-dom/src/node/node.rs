@@ -1900,9 +1900,14 @@ impl Node {
             .unwrap_or(crate::util::Point { x, y })
     }
 
-    /// Whether this node can act as an [`offset_parent`](Self::offset_parent): a positioned
-    /// element, or one of the elements that always qualify (`body`, `td`, `th`).
-    pub(crate) fn is_offset_parent(&self) -> bool {
+    /// Whether this node can act as an [`offset_parent`](Self::offset_parent)
+    /// (<https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetparent>): a
+    /// positioned element, the body element, or, for an element whose own
+    /// `position` is static, a `td`, `th`, or `table` ancestor.
+    ///
+    /// `static_element` is the queried element's computed `position`, which the
+    /// last rule depends on.
+    pub(crate) fn is_offset_parent(&self, static_element: bool) -> bool {
         let Some(styles) = self.primary_styles() else {
             return false;
         };
@@ -1910,8 +1915,18 @@ impl Node {
             return true;
         }
         self.data.is_element_with_tag_name(&local_name!("body"))
-            || self.data.is_element_with_tag_name(&local_name!("td"))
-            || self.data.is_element_with_tag_name(&local_name!("th"))
+            || (static_element
+                && (self.data.is_element_with_tag_name(&local_name!("td"))
+                    || self.data.is_element_with_tag_name(&local_name!("th"))
+                    || self.data.is_element_with_tag_name(&local_name!("table"))))
+    }
+
+    /// Whether this node's computed `position` is `static`. A `td`, `th`, or
+    /// `table` ancestor is an offset parent only for such an element
+    /// (<https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetparent>).
+    pub(crate) fn is_statically_positioned(&self) -> bool {
+        self.primary_styles()
+            .is_none_or(|styles| styles.get_box().position == Position::Static)
     }
 
     /// Whether this node is a non-positioned `body` element. When such an element is the
@@ -1928,9 +1943,10 @@ impl Node {
     /// CSSOM View's `offsetParent`.
     pub fn offset_parent(&self) -> Option<&Node> {
         let mut node = self;
+        let static_element = self.is_statically_positioned();
         loop {
             node = self.with(node.containing_block()?);
-            if node.is_offset_parent() {
+            if node.is_offset_parent(static_element) {
                 return Some(node);
             }
         }
@@ -2047,6 +2063,7 @@ impl Node {
         let mut x = 0.0;
         let mut y = 0.0;
         let mut current = self;
+        let static_element = self.is_statically_positioned();
 
         // Non-atomic inlines have no layout box of their own: start from the first
         // fragment box (relative to the inline root's border box) and continue the
@@ -2059,7 +2076,7 @@ impl Node {
             let Some(inline_root) = self.inline_root_ancestor() else {
                 return crate::util::Point { x, y };
             };
-            if inline_root.is_offset_parent() && !inline_root.is_static_body() {
+            if inline_root.is_offset_parent(static_element) && !inline_root.is_static_body() {
                 let border = inline_root.final_layout().border;
                 return crate::util::Point {
                     x: x - border.left,
@@ -2078,10 +2095,21 @@ impl Node {
                 break;
             };
             let parent = self.with(parent_id);
-            if parent.is_offset_parent() && !parent.is_static_body() {
+            if parent.is_offset_parent(static_element) && !parent.is_static_body() {
                 let border = parent.final_layout().border;
-                x -= border.left;
-                y -= border.top;
+                let (mut border_x, mut border_y) = (border.left, border.top);
+                // A table with captions is the wrapper box, whose content starts
+                // at the first caption; the element's own layout is the grid
+                // inside it. Measure from the wrapper's padding edge, which has
+                // no border of its own.
+                if let Some((grid_offset, _)) = parent.table_wrapper() {
+                    x += grid_offset.x;
+                    y += grid_offset.y;
+                    border_x = 0.0;
+                    border_y = 0.0;
+                }
+                x -= border_x;
+                y -= border_y;
                 break;
             }
             current = parent;
@@ -2194,6 +2222,23 @@ impl Node {
                 y: if reversed.y { 0.0 } else { height },
             },
         )
+    }
+
+    /// The grid box's offset inside the table wrapper box and the wrapper's
+    /// size, when this node is a table with captions.
+    ///
+    /// A table element's box is the wrapper box, which holds the caption boxes
+    /// and the grid. Blitz stores the grid's box as the element's own layout, so
+    /// CSSOM View's client and offset metrics read the wrapper from here
+    /// (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+    pub fn table_wrapper(&self) -> Option<(taffy::Point<f32>, taffy::Size<f32>)> {
+        let table = self.element_data()?.table_root.as_ref()?;
+        if table.captions.is_empty() {
+            return None;
+        }
+        let grid = *table.grid_layout.borrow();
+        let size = *table.wrapper_size.borrow();
+        Some((grid?.location, size?))
     }
 
     /// Does the node generate any boxes? (e.g. `getClientRects()` returns an empty

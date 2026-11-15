@@ -22,24 +22,49 @@ use style::{
 };
 use style_traits::values::specified::AllowedNumericType;
 use taffy::{
-    DetailedGridInfo, LayoutPartialTree as _, ResolveOrZero, TrackSizingFunction, style_helpers,
+    DetailedGridInfo, LayoutPartialTree as _, ResolveOrZero, TrackSizingFunction,
+    compute_block_layout, style_helpers,
 };
 
-use crate::BaseDocument;
 use crate::layout::LayoutPassState;
+use crate::{BaseDocument, taffy_node_id};
 
 use super::damage::{CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC};
 use super::resolve_calc_value;
 
+// Deliberately not `Clone`: `style` may hold raw pointers into `calc_values`.
 pub struct TableTreeWrapper<'a, 'doc> {
     pub(crate) doc: &'a mut LayoutPassState<'doc>,
     pub(crate) ctx: Arc<TableContext>,
 }
 
-// Deliberately not `Clone`: `style` may hold raw pointers into `calc_values`.
+/// A `display: table-caption` box placed above or below the table grid.
+///
+/// The caption is a sibling of the grid in the box tree, as in a browser's
+/// table wrapper box, so the table element's own box is the wrapper that
+/// contains both (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+#[derive(Debug, Clone)]
+pub struct TableCaption {
+    pub node_id: NodeId,
+    /// The caption sits below the grid (`caption-side: bottom`).
+    pub bottom: bool,
+    /// The caption's box style, used for its block layout.
+    pub style: taffy::Style<Atom>,
+}
+
 #[derive(Debug)]
 pub struct TableContext {
     pub style: taffy::Style<Atom>,
+    /// The wrapper box's style: the table's margins and positioning without the
+    /// grid's border, padding or size, which belong to the grid.
+    pub wrapper_style: taffy::Style<Atom>,
+    /// Captions laid out above or below the grid, top captions first.
+    pub captions: Vec<TableCaption>,
+    /// The grid box's position and size inside the wrapper box, recorded by the
+    /// wrapper's block layout (relative to the wrapper's border box).
+    pub grid_layout: AtomicRefCell<Option<taffy::Layout>>,
+    /// The wrapper box's size, which is the table element's box.
+    pub wrapper_size: AtomicRefCell<Option<taffy::Size<f32>>>,
     pub cells: Vec<TableCell>,
     /// Absolutely positioned descendants of the table's row groups and rows (and of the
     /// table itself). They take no part in the table grid.
@@ -241,6 +266,32 @@ pub(crate) fn build_table_context(
 
     drop(stylo_styles);
 
+    // A caption is not part of the grid: it is laid out by the table wrapper
+    // box, above or below the grid, and widens the table element
+    // (<https://drafts.csswg.org/css-tables-3/#caption>).
+    let mut captions: Vec<TableCaption> = Vec::new();
+    for child_id in children.iter().copied() {
+        let node = &doc.nodes[child_id];
+        if !node
+            .display_style()
+            .is_some_and(|display| display.outside() == DisplayOutside::TableCaption)
+        {
+            continue;
+        }
+        let Some(styles) = node.primary_styles() else {
+            continue;
+        };
+        captions.push(TableCaption {
+            node_id: child_id,
+            bottom: styles.slow_clone_caption_side()
+                == style::values::computed::table::CaptionSide::Bottom,
+            style: table_taffy_style(&styles, wm),
+        });
+    }
+    // Top captions stack above the grid, bottom captions below it, each side in
+    // document order.
+    captions.sort_by_key(|caption| caption.bottom);
+
     let mut columns: Vec<TableColumn> = Vec::new();
     let mut column_sizes: Vec<taffy::TrackSizingFunction> = Vec::new();
     for child_id in children.iter().copied() {
@@ -271,6 +322,9 @@ pub(crate) fn build_table_context(
     };
     for order in 0..3 {
         for child_id in children.iter().copied() {
+            if captions.iter().any(|caption| caption.node_id == child_id) {
+                continue;
+            }
             if row_group_order(doc, child_id) != order {
                 continue;
             }
@@ -371,8 +425,22 @@ pub(crate) fn build_table_context(
         BorderCollapse::Separate => {
             // In the separated borders model, `border-spacing` also applies between
             // the table border and the outermost cells, in addition to between cells.
-            let spacing_x = border_spacing.width.px();
-            let spacing_y = border_spacing.height.px();
+            // Border-spacing surrounds the grid. A table with neither a cell nor
+            // an explicit row or column has an empty grid, which has no spacing;
+            // explicit tracks still separate (and so add spacing around) the
+            // anonymous cells the grid generates for them
+            // (<https://drafts.csswg.org/css-tables-3/#missing-cells-fixup>).
+            let spaced = !cells.is_empty() || !rows.is_empty() || !columns.is_empty();
+            let spacing_x = if spaced {
+                border_spacing.width.px()
+            } else {
+                0.0
+            };
+            let spacing_y = if spaced {
+                border_spacing.height.px()
+            } else {
+                0.0
+            };
             let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
             style.padding = taffy::Rect {
                 left: style_helpers::length(padding.left + spacing_x),
@@ -411,17 +479,53 @@ pub(crate) fn build_table_context(
         };
     }
 
+    // The caption boxes are children of the element in the box tree: they paint
+    // and hit test as part of it, and their own content is constructed from the
+    // layout children.
     let layout_children = cells
         .iter()
         .map(|cell| cell.node_id)
         .chain(oof_children.iter().map(|(node_id, _)| *node_id))
+        .chain(captions.iter().map(|caption| caption.node_id))
         .collect();
+    // With captions the element's box is the wrapper: an anonymous block that
+    // holds the captions and the grid. The wrapper takes the table's margin,
+    // positioning and insets; the grid keeps the border, padding and size, and
+    // is laid out in flow inside the wrapper
+    // (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+    let mut wrapper_style = taffy::Style::<Atom>::DEFAULT;
+    wrapper_style.display = taffy::Display::Block;
+    wrapper_style.position = style.position;
+    wrapper_style.inset = style.inset;
+    wrapper_style.margin = style.margin;
+    wrapper_style.box_sizing = taffy::BoxSizing::BorderBox;
+    if !captions.is_empty() {
+        style.position = taffy::Position::Static;
+        style.inset = taffy::Rect::auto();
+        style.margin = taffy::Rect::ZERO.map(style_helpers::length);
+        // `float` and `clear` also belong to the wrapper
+        // (<https://www.w3.org/TR/CSS21/tables.html#table-box>): the grid is
+        // always in flow inside it, so leaving them on the grid would float the
+        // grid inside its own wrapper.
+        #[cfg(feature = "floats")]
+        {
+            wrapper_style.float = style.float;
+            wrapper_style.clear = style.clear;
+            style.float = taffy::Float::None;
+            style.clear = taffy::Clear::None;
+        }
+    }
+
     let root_node = &mut doc.nodes[table_root_node_id];
     root_node.children = children;
 
     (
         TableContext {
             style,
+            wrapper_style,
+            captions,
+            grid_layout: AtomicRefCell::new(None),
+            wrapper_size: AtomicRefCell::new(None),
             cells,
             oof_children,
             rows,
@@ -757,6 +861,239 @@ fn collect_table_cells(
             // Ignore
         }
     }
+}
+
+/// The table wrapper box: the anonymous block a browser puts around a table's
+/// captions and grid. It exists only in layout; the element's own box is this
+/// wrapper, and its children are the caption boxes and the grid
+/// (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+///
+/// The wrapper names its children by their real node ids rather than by wrapper
+/// positions: taffy records out-of-flow candidates and unrounded layouts against
+/// the ids it is handed, and Blitz reads those ids back as DOM nodes.
+pub struct TableWrapperTree<'a, 'doc> {
+    doc: &'a mut LayoutPassState<'doc>,
+    ctx: Arc<TableContext>,
+    /// The grid's node: the table element itself.
+    grid: taffy::NodeId,
+    /// The wrapper's children in flow order: the top captions, the grid, then
+    /// the bottom captions.
+    children: Vec<taffy::NodeId>,
+}
+
+impl<'a, 'doc> TableWrapperTree<'a, 'doc> {
+    fn new(
+        doc: &'a mut LayoutPassState<'doc>,
+        ctx: Arc<TableContext>,
+        grid: taffy::NodeId,
+    ) -> Self {
+        // `captions` is sorted with the bottom captions last, so the grid goes
+        // before the first one.
+        let mut children = Vec::with_capacity(ctx.captions.len() + 1);
+        let mut placed = false;
+        for caption in &ctx.captions {
+            if caption.bottom && !placed {
+                children.push(grid);
+                placed = true;
+            }
+            children.push(taffy_node_id(caption.node_id));
+        }
+        if !placed {
+            children.push(grid);
+        }
+        Self {
+            doc,
+            ctx,
+            grid,
+            children,
+        }
+    }
+
+    fn caption(&self, node_id: taffy::NodeId) -> Option<&TableCaption> {
+        self.ctx
+            .captions
+            .iter()
+            .find(|caption| taffy_node_id(caption.node_id) == node_id)
+    }
+}
+
+impl taffy::TraversePartialTree for TableWrapperTree<'_, '_> {
+    type ChildIter<'a>
+        = std::iter::Copied<std::slice::Iter<'a, taffy::NodeId>>
+    where
+        Self: 'a;
+
+    fn child_ids(&self, _node_id: taffy::NodeId) -> Self::ChildIter<'_> {
+        self.children.iter().copied()
+    }
+
+    fn child_count(&self, _node_id: taffy::NodeId) -> usize {
+        self.children.len()
+    }
+
+    fn get_child_id(&self, _node_id: taffy::NodeId, index: usize) -> taffy::NodeId {
+        self.children[index]
+    }
+}
+impl taffy::TraverseTree for TableWrapperTree<'_, '_> {}
+
+impl taffy::LayoutPartialTree for TableWrapperTree<'_, '_> {
+    type CoreContainerStyle<'a>
+        = &'a taffy::Style<Atom>
+    where
+        Self: 'a;
+
+    type CustomIdent = Atom;
+
+    fn get_core_container_style(&self, _node_id: taffy::NodeId) -> &taffy::Style<Atom> {
+        &self.ctx.wrapper_style
+    }
+
+    fn resolve_calc_value(&self, calc_ptr: *const (), parent_size: f32) -> f32 {
+        resolve_calc_value(calc_ptr, parent_size)
+    }
+
+    fn set_unrounded_layout(&mut self, node_id: taffy::NodeId, layout: &taffy::Layout) {
+        // The grid's layout is where the table's own box sits inside the
+        // wrapper. The element's box is re-expressed from it once the parent
+        // has placed the wrapper
+        // (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+        if node_id == self.grid {
+            *self.ctx.grid_layout.borrow_mut() = Some(*layout);
+            return;
+        }
+        self.doc.set_unrounded_layout(node_id, layout);
+    }
+
+    fn compute_child_layout(
+        &mut self,
+        node_id: taffy::NodeId,
+        inputs: taffy::LayoutInput,
+    ) -> taffy::LayoutOutput {
+        if node_id == self.grid {
+            let mut grid = TableTreeWrapper {
+                doc: self.doc,
+                ctx: self.ctx.clone(),
+            };
+            return taffy::compute_grid_layout(&mut grid, node_id, inputs);
+        }
+        if self.caption(node_id).is_some() {
+            return self.doc.compute_child_layout(node_id, inputs);
+        }
+        taffy::LayoutOutput::HIDDEN
+    }
+}
+
+impl taffy::LayoutBlockContainer for TableWrapperTree<'_, '_> {
+    type BlockContainerStyle<'a>
+        = &'a taffy::Style<Atom>
+    where
+        Self: 'a;
+
+    type BlockItemStyle<'a>
+        = &'a taffy::Style<Atom>
+    where
+        Self: 'a;
+
+    fn get_block_container_style(&self, _node_id: taffy::NodeId) -> Self::BlockContainerStyle<'_> {
+        &self.ctx.wrapper_style
+    }
+
+    fn get_block_child_style(&self, child_node_id: taffy::NodeId) -> Self::BlockItemStyle<'_> {
+        if child_node_id == self.grid {
+            &self.ctx.style
+        } else {
+            self.caption(child_node_id)
+                .map_or(&self.ctx.style, |caption| &caption.style)
+        }
+    }
+}
+
+/// Lay out a table that has captions: the table element's box is the wrapper
+/// box, so its size is the wider of the grid and the captions, and its height
+/// sums the captions and the grid
+/// (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+///
+/// `grid` is the grid's layout from the table's own inputs, used to size the
+/// wrapper; the grid is then laid out again inside the wrapper, where an `auto`
+/// width stretches to the wrapper.
+pub(crate) fn layout_table_with_captions(
+    doc: &mut LayoutPassState<'_>,
+    table_node_id: taffy::NodeId,
+    inputs: taffy::LayoutInput,
+    context: Arc<TableContext>,
+    grid: &taffy::LayoutOutput,
+) -> taffy::LayoutOutput {
+    // The wrapper is as wide as the widest of the grid and the captions'
+    // margin boxes, but no wider than the containing block when that block is
+    // wider than the table: a shrink-to-fit ancestor sized from the table
+    // itself must not shrink a wider caption, since the table's preferred width
+    // includes its captions
+    // (<https://drafts.csswg.org/css-tables-3/#computing-the-table-width>).
+    let mut width = grid.size.width;
+    for caption in &context.captions {
+        width = width.max(caption_margin_box(doc, caption, inputs.parent_size));
+    }
+    if let Some(available) = inputs.parent_size.width
+        && available > grid.size.width
+    {
+        width = width.min(available);
+    }
+
+    let mut wrapper_inputs = inputs;
+    wrapper_inputs.known_dimensions.width = Some(width);
+    wrapper_inputs.known_dimensions.height = None;
+
+    let mut tree = TableWrapperTree::new(doc, context.clone(), table_node_id);
+    let output = compute_block_layout(&mut tree, table_node_id, wrapper_inputs, None);
+    *context.wrapper_size.borrow_mut() = Some(output.size);
+
+    // The wrapper positioned the captions in the wrapper's own coordinate
+    // space, but a caption's parent is the table element, whose box is the grid
+    // inside the wrapper: move the captions onto that origin so that paint, hit
+    // testing, and offsets agree
+    // (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+    let grid_offset = context
+        .grid_layout
+        .borrow()
+        .map_or(taffy::Point::ZERO, |layout| layout.location);
+    for caption in &context.captions {
+        let layout = doc.nodes[caption.node_id].unrounded_layout_mut();
+        layout.location.x -= grid_offset.x;
+        layout.location.y -= grid_offset.y;
+    }
+    output
+}
+
+/// The width of a caption's margin box, which is the part that widens the table
+/// wrapper.
+fn caption_margin_box(
+    doc: &mut LayoutPassState<'_>,
+    caption: &TableCaption,
+    parent_size: taffy::Size<Option<f32>>,
+) -> f32 {
+    let inputs = taffy::LayoutInput {
+        run_mode: taffy::RunMode::ComputeSize,
+        sizing_mode: taffy::SizingMode::InherentSize,
+        axis: taffy::RequestedAxis::Horizontal,
+        known_dimensions: taffy::Size::NONE,
+        known_dimensions_are_definite: taffy::Size {
+            width: false,
+            height: false,
+        },
+        parent_size,
+        available_space: taffy::Size {
+            width: taffy::AvailableSpace::MaxContent,
+            height: taffy::AvailableSpace::MaxContent,
+        },
+        vertical_margins_are_collapsible: taffy::Line::FALSE,
+    };
+    let output = doc.compute_child_layout(taffy_node_id(caption.node_id), inputs);
+    let margin = caption
+        .style
+        .margin
+        .resolve_or_zero(parent_size.width, resolve_calc_value);
+    output.size.width + margin.left + margin.right
 }
 
 pub struct RangeIter(Range<usize>);

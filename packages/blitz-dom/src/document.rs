@@ -3466,13 +3466,25 @@ impl BaseDocument {
             return rects.reduce(BoundingRect::union);
         }
 
-        self.get_node(node_id)?;
+        let node = self.get_node(node_id)?;
         let (pos, layout) = self.physical_unrounded_geometry(node_id);
-        let size = layout.size;
-
+        // A table with captions is its wrapper box, which holds the caption
+        // boxes above and below the grid
+        // (<https://drafts.csswg.org/css-tables-3/#table-wrapper-box>).
+        let (origin, size) = match node.table_wrapper() {
+            Some((grid_offset, wrapper_size)) => (
+                crate::util::Point {
+                    x: pos.x - grid_offset.x,
+                    y: pos.y - grid_offset.y,
+                },
+                wrapper_size,
+            ),
+            None => (pos, layout.size),
+        };
+        let scroll = self.viewport_scroll();
         Some(BoundingRect {
-            x: snap_to_layout_unit(pos.x as f64 - self.viewport_scroll().x),
-            y: snap_to_layout_unit(pos.y as f64 - self.viewport_scroll().y),
+            x: snap_to_layout_unit(origin.x as f64 - scroll.x),
+            y: snap_to_layout_unit(origin.y as f64 - scroll.y),
             width: snap_to_layout_unit(size.width as f64),
             height: snap_to_layout_unit(size.height as f64),
         })
@@ -3493,6 +3505,16 @@ impl BaseDocument {
         // Nodes with their own layout box: use it directly
         let Some(rects) = self.inline_fragment_rects(node_id) else {
             let pos = node.offset_top_left();
+            // A table with captions measures as its wrapper box, which starts at
+            // the top captions and ends after the grid or the bottom captions.
+            if let Some((grid_offset, wrapper_size)) = node.table_wrapper() {
+                return Some(BoundingRect {
+                    x: f64::from(pos.x - grid_offset.x),
+                    y: f64::from(pos.y - grid_offset.y),
+                    width: f64::from(wrapper_size.width),
+                    height: f64::from(wrapper_size.height),
+                });
+            }
             let size = node.unrounded_layout().size;
             #[cfg(feature = "writing-mode")]
             let size = match node.containing_block() {
@@ -3523,7 +3545,8 @@ impl BaseDocument {
 
         // Resolve the offsetParent from the inline root (the root itself if it is positioned)
         let inline_root = node.inline_root_ancestor()?;
-        let offset_parent = if inline_root.is_offset_parent() {
+        let static_element = node.is_statically_positioned();
+        let offset_parent = if inline_root.is_offset_parent(static_element) {
             Some(inline_root)
         } else {
             inline_root.offset_parent()
