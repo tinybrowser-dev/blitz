@@ -1968,14 +1968,15 @@ impl Node {
                             continue;
                         }
                         let x0 = inline_box.x;
-                        let y0 = inline_box.y;
-                        union(
-                            &mut line_rect,
-                            x0,
-                            y0,
-                            x0 + inline_box.width,
-                            y0 + inline_box.height,
-                        );
+                        // An inline box's fragment covers the line box's block
+                        // extent, not the atomic child's own box: an
+                        // `inline-block` taller than the line does not make
+                        // its wrapping inline's client rect that tall
+                        // (<https://drafts.csswg.org/css2/#inline-box-height>,
+                        // <https://drafts.csswg.org/cssom-view/#dom-element-getclientrects>).
+                        let y0 = line_metrics.block_min_coord;
+                        let y1 = line_metrics.block_max_coord;
+                        union(&mut line_rect, x0, y0, x0 + inline_box.width, y1);
                     }
                 }
             }
