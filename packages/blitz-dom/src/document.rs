@@ -410,6 +410,11 @@ pub struct BaseDocument {
     pub(crate) scrollbar_activity: HashMap<NodeId, Instant>,
     /// The smooth scrolls and fling currently in progress
     pub(crate) scroll_animations: ScrollAnimations,
+    /// The scrolling boxes that moved since the last scroll steps, in order
+    pub(crate) pending_scrolls: Vec<crate::scrolling::ScrollEventTarget>,
+    /// The scrolling boxes whose scroll operation completed since the last
+    /// scroll steps, in order
+    pub(crate) pending_scrollends: Vec<crate::scrolling::ScrollEventTarget>,
     /// The document's animation timeline in milliseconds, sampled at the start
     /// of every [`BaseDocument::resolve`] from the embedder's clock. A smooth
     /// scroll advances on it, so it follows the same clock as frames and timers
@@ -890,6 +895,8 @@ impl BaseDocument {
             hovered_scrollbar: None,
             scrollbar_activity: HashMap::new(),
             scroll_animations: ScrollAnimations::default(),
+            pending_scrolls: Vec::new(),
+            pending_scrollends: Vec::new(),
             animation_time_ms: 0.0,
             text_selection: TextSelection::default(),
         };

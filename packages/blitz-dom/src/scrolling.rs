@@ -52,6 +52,40 @@ pub(crate) enum ScrollTarget {
     Viewport,
 }
 
+/// The scrolling box a queued scroll event belongs to
+/// (<https://drafts.csswg.org/cssom-view/#scrolling-events>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollEventTarget {
+    /// The viewport, whose events fire at its Document.
+    Viewport,
+    /// An element's own scrolling box, whose events fire at that element.
+    Element(NodeId),
+}
+
+/// Which of the two events a queued entry names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollEventKind {
+    Scroll,
+    ScrollEnd,
+}
+
+/// One entry of a document's pending scroll events list. `scroll` entries come
+/// before the `scrollend` entries of the same run of scroll steps
+/// (<https://drafts.csswg.org/cssom-view/#document-pending-scroll-events>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingScrollEvent {
+    pub target: ScrollEventTarget,
+    pub kind: ScrollEventKind,
+}
+
+/// The event target for a scroll of `target`.
+fn scroll_event_target(target: ScrollTarget) -> ScrollEventTarget {
+    match target {
+        ScrollTarget::Viewport => ScrollEventTarget::Viewport,
+        ScrollTarget::Node(node) => ScrollEventTarget::Element(node),
+    }
+}
+
 /// Whether an axis with this computed overflow has a scrolling box.
 ///
 /// `visible` and `clip` have none; `hidden` does for programmatic scrolls
@@ -295,11 +329,26 @@ impl BaseDocument {
         };
 
         if self.should_scroll_smoothly(target, request.behavior) {
-            self.start_scroll_animation(target, end);
+            // A smooth scroll that cannot move the box performs no scroll and
+            // fires no events; only an ongoing animation replaces itself
+            // (<https://drafts.csswg.org/cssom-view/#scroll-an-element>, "If
+            // position is the same as box's current scroll position").
+            if end != current || self.scroll_animations.smooth.contains_key(&target) {
+                self.start_scroll_animation(target, end);
+            }
             return end != current;
         }
 
         let has_changed = self.write_scroll_offset(target, end, dispatch_event);
+
+        // An instant scroll completes here. `write_scroll_offset` queued the
+        // `scroll` entry, and the scroll steps fire `scrollend` after it. A
+        // user scroll's momentum is not modelled, so only a programmatic one
+        // has an end to report
+        // (<https://drafts.csswg.org/cssom-view/#scrolling-events>).
+        if has_changed && request.source == ScrollSource::Programmatic {
+            self.note_scroll_ended(scroll_event_target(target));
+        }
 
         // Transfer the delta the target could not consume to the next scroller in the chain.
         if request.overflow == ScrollOverflow::Chain {
@@ -409,6 +458,52 @@ impl BaseDocument {
         }
     }
 
+    /// Note that `target` scrolled, so the next scroll steps fire `scroll` at
+    /// it. The list holds one entry per box, however often it moved
+    /// (<https://drafts.csswg.org/cssom-view/#scrolling-events>).
+    fn note_scrolled(&mut self, target: ScrollEventTarget) {
+        if !self.pending_scrolls.contains(&target) {
+            self.pending_scrolls.push(target);
+        }
+    }
+
+    /// Note that `target` completed a scroll operation, so the next scroll
+    /// steps fire `scrollend` at it after the `scroll` entries.
+    fn note_scroll_ended(&mut self, target: ScrollEventTarget) {
+        if !self.pending_scrollends.contains(&target) {
+            self.pending_scrollends.push(target);
+        }
+    }
+
+    /// Take the pending scroll events and empty the list: every `scroll`
+    /// entry in the order the boxes moved, then every `scrollend` entry
+    /// (<https://drafts.csswg.org/cssom-view/#run-the-scroll-steps>).
+    pub fn take_pending_scroll_events(&mut self) -> Vec<PendingScrollEvent> {
+        let mut events =
+            Vec::with_capacity(self.pending_scrolls.len() + self.pending_scrollends.len());
+        for target in std::mem::take(&mut self.pending_scrolls) {
+            events.push(PendingScrollEvent {
+                target,
+                kind: ScrollEventKind::Scroll,
+            });
+        }
+        for target in std::mem::take(&mut self.pending_scrollends) {
+            events.push(PendingScrollEvent {
+                target,
+                kind: ScrollEventKind::ScrollEnd,
+            });
+        }
+        events
+    }
+
+    /// Whether a smooth scroll or a fling is still running. The embedder gives
+    /// a document with one a rendering opportunity, because a scroll animation
+    /// advances at frames, not on the wall clock
+    /// (<https://drafts.csswg.org/cssom-view/#scroll-an-element>).
+    pub fn has_scroll_animation(&self) -> bool {
+        self.scroll_animations.is_animating()
+    }
+
     /// Write a scroll target's offset (which must already be clamped to its scrollable
     /// range), dispatching a `scroll` event and returning whether the offset changed.
     pub(crate) fn write_scroll_offset(
@@ -440,6 +535,7 @@ impl BaseDocument {
                     dispatch_event(DomEvent::new(root_id, DomEventData::Scroll(event)));
                 }
 
+                self.note_scrolled(ScrollEventTarget::Viewport);
                 self.request_redraw();
                 true
             }
@@ -468,6 +564,7 @@ impl BaseDocument {
                 };
                 dispatch_event(DomEvent::new(node_id, DomEventData::Scroll(event)));
 
+                self.note_scrolled(ScrollEventTarget::Element(node_id));
                 self.show_scrollbars(node_id);
                 self.request_redraw();
                 true
@@ -856,13 +953,46 @@ impl BaseDocument {
         if nearest {
             containers.truncate(1);
         }
+        // Each inner scroll moves the target for the outer alignment: the
+        // scrolls start together, so the inner box's offset has not been
+        // applied to layout when the outer box is measured. Carry the amount
+        // the inner boxes will scroll forward instead
+        // (<https://drafts.csswg.org/cssom-view/#scroll-a-target-into-view>).
+        let mut pending = Point::ZERO;
         for container in containers {
-            self.scroll_target_in_container(node_id, container, behavior, block, inline);
+            let target = ScrollTarget::Node(container);
+            let before = self.scroll_state(target, true).0;
+            self.scroll_target_in_container(node_id, container, behavior, block, inline, pending);
+            // An instant scroll is already in the offsets the next measurement
+            // reads; only an animation still owes layout the distance.
+            if self
+                .scroll_animations
+                .smooth
+                .contains_key(&self.canonical_scroll_target(target))
+            {
+                let after = self.eventual_scroll(target);
+                pending.x += after.x - before.x;
+                pending.y += after.y - before.y;
+            }
         }
         // `container: "nearest"` aborts after the nearest scrolling box, so the
         // viewport only scrolls when the target has no ancestor scroller.
         if (!nearest || !scrolled_containers) && !chain_fixed_to_viewport {
-            self.scroll_target_in_viewport(node_id, behavior, block, inline, root);
+            self.scroll_target_in_viewport(node_id, behavior, block, inline, root, pending);
+        }
+    }
+
+    /// The offset `target` will have once the scroll started for it has
+    /// finished: a smooth scroll's endpoint, or the offset already written by
+    /// an instant one.
+    fn eventual_scroll(&self, target: ScrollTarget) -> Point<f64> {
+        match self
+            .scroll_animations
+            .smooth
+            .get(&self.canonical_scroll_target(target))
+        {
+            Some(scroll_to) => scroll_to.end,
+            None => self.scroll_state(target, true).0,
         }
     }
 
@@ -877,6 +1007,7 @@ impl BaseDocument {
         behavior: ScrollBehavior,
         block: ScrollLogicalPosition,
         inline: ScrollLogicalPosition,
+        pending: Point<f64>,
     ) {
         let Some(target) = self.nodes.get(target_id) else {
             return;
@@ -899,8 +1030,8 @@ impl BaseDocument {
             (scroll.x, scroll.y),
             (client_width, client_height),
             (
-                target_position.x as f64 - (container_position.x + border.left) as f64,
-                target_position.y as f64 - (container_position.y + border.top) as f64,
+                target_position.x as f64 - (container_position.x + border.left) as f64 - pending.x,
+                target_position.y as f64 - (container_position.y + border.top) as f64 - pending.y,
             ),
             (target_size.width as f64, target_size.height as f64),
             LogicalAxis::block(writing_mode),
@@ -919,6 +1050,7 @@ impl BaseDocument {
         block: ScrollLogicalPosition,
         inline: ScrollLogicalPosition,
         root: Option<NodeId>,
+        pending: Point<f64>,
     ) {
         let Some(root) = root else {
             return;
@@ -942,7 +1074,10 @@ impl BaseDocument {
         let (x, y) = Self::aligned_offsets(
             (scroll.x, scroll.y),
             (viewport_width, viewport_height),
-            (target_position.x as f64, target_position.y as f64),
+            (
+                target_position.x as f64 - pending.x,
+                target_position.y as f64 - pending.y,
+            ),
             (target_size.width as f64, target_size.height as f64),
             LogicalAxis::block(writing_mode),
             LogicalAxis::inline(writing_mode),
@@ -1107,6 +1242,10 @@ impl BaseDocument {
             self.write_scroll_offset(target, position, &mut |_| {});
 
             if progress >= 1.0 {
+                // The smooth scroll has arrived: the next scroll steps report
+                // its end after the final `scroll` entry
+                // (<https://drafts.csswg.org/cssom-view/#scrolling-events>).
+                self.note_scroll_ended(scroll_event_target(target));
                 self.scroll_animations.smooth.remove(&target);
             }
         }
