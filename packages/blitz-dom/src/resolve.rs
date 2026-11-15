@@ -62,6 +62,11 @@ impl BaseDocument {
             return;
         }
 
+        // A smooth scroll is timed on the document's animation timeline: the
+        // embedder samples it once per resolve, so the animation advances with
+        // the frames and timers the page observes
+        // (<https://drafts.csswg.org/cssom-view/#scroll-an-element>).
+        self.animation_time_ms = current_time_for_animations * 1000.0;
         self.resolve_scroll_animation();
 
         // Drop scrollbar-activity entries whose fade-out has finished (also

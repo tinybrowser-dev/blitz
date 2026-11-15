@@ -1,6 +1,8 @@
 //! Scrolling: user-initiated (interactive) and programmatic scrolling of nodes and the
 //! viewport, and the scroll animations (smooth scrolls and flings) which drive them.
 
+use std::collections::HashMap;
+
 use blitz_traits::events::{BlitzScrollEvent, DomEvent, DomEventData};
 use blitz_traits::node_id::NodeId;
 use markup5ever::local_name;
@@ -44,7 +46,7 @@ pub enum ScrollIntoViewContainer {
 /// Per the CSS overflow propagation rules the root element has no scrolling mechanism of its
 /// own (its overflow is applied to the viewport), so [`ScrollTarget::Node`] holding the root
 /// element is equivalent to [`ScrollTarget::Viewport`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ScrollTarget {
     Node(NodeId),
     Viewport,
@@ -189,24 +191,49 @@ pub(crate) struct FlingState {
 /// fragment navigation (`#anchor` links) and programmatic smooth scrolling.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScrollToState {
-    /// What is being scrolled.
-    pub(crate) target: ScrollTarget,
     /// The scroll offset at the start of the animation.
     pub(crate) start: Point<f64>,
     /// The scroll offset to animate towards.
     pub(crate) end: Point<f64>,
-    /// Time (in milliseconds since the Unix epoch) at which the animation started.
+    /// The animation timeline (in milliseconds) at which the scroll started.
     pub(crate) start_time: f64,
     /// Total duration of the animation in milliseconds.
     pub(crate) duration: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ScrollAnimationState {
-    None,
-    Fling(FlingState),
-    /// A smooth scroll of the viewport towards a target offset.
-    ScrollTo(ScrollToState),
+/// The scrolling animations a document is running.
+///
+/// A smooth scroll belongs to the scrolling box it moves, and separate boxes
+/// animate independently: `scrollIntoView` on a nested scroller and the
+/// viewport it finally reaches are two targets, and two `scrollIntoView` calls
+/// on unrelated scrollers keep both animations
+/// (<https://drafts.csswg.org/cssom-view/#scroll-an-element>). A fling is one
+/// gesture chained through whichever scrollers lie under the pointer, so it has
+/// a single slot of its own.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScrollAnimations {
+    /// One in-flight smooth scroll per scrolling box.
+    smooth: HashMap<ScrollTarget, ScrollToState>,
+    /// The fling a touch pan produced, if it is still moving.
+    pub(crate) fling: Option<FlingState>,
+}
+
+impl ScrollAnimations {
+    /// Whether any scroll still has to advance.
+    pub(crate) fn is_animating(&self) -> bool {
+        self.fling.is_some() || !self.smooth.is_empty()
+    }
+
+    /// Abort the smooth scroll of `target`, if it has one.
+    pub(crate) fn abort_smooth(&mut self, target: ScrollTarget) {
+        self.smooth.remove(&target);
+    }
+
+    /// Abort every scroll animation.
+    pub(crate) fn clear(&mut self) {
+        self.smooth.clear();
+        self.fling = None;
+    }
 }
 
 /// Cubic ease-in-out easing function, mapping a normalised time `t` in `[0, 1]`
@@ -232,13 +259,14 @@ impl BaseDocument {
         request: ScrollRequest,
         dispatch_event: &mut dyn FnMut(DomEvent),
     ) -> bool {
-        if request.interrupt_animation
-            && matches!(self.scroll_animation, ScrollAnimationState::ScrollTo(_))
-        {
-            self.scroll_animation = ScrollAnimationState::None;
-        }
-
         let target = self.canonical_scroll_target(request.target);
+
+        // A user-initiated scroll takes over the box it moves: a smooth scroll
+        // already running there would fight it for the rest of its duration
+        // (<https://drafts.csswg.org/cssom-view/#scrolling-box>).
+        if request.interrupt_animation {
+            self.scroll_animations.abort_smooth(target);
+        }
 
         // Text inputs and sub-documents scroll their own content rather than an overflow
         // scrollport, so they only take part in the chained (user-initiated) path.
@@ -544,13 +572,32 @@ impl BaseDocument {
                 // both the root element itself and any content which overflows it (e.g. when
                 // the root element has a fixed height but its content is taller). A document
                 // without a root element has no scrollable content.
+                //
+                // The root positioning pass lays out the boxes whose containing block is the
+                // initial containing block after the root's own layout was produced, so their
+                // extents are added here. A fixed box does not scroll with the document and
+                // stays out
+                // (<https://drafts.csswg.org/css-overflow-3/#scrollable>).
                 let (content_width, content_height) = match self.try_root_element() {
                     Some(root) => {
                         let layout = root.final_layout();
-                        (
-                            layout.size.width.max(root.scroll_width()) as f64,
-                            layout.size.height.max(root.scroll_height()) as f64,
-                        )
+                        let mut width = layout.size.width.max(root.scroll_width());
+                        let mut height = layout.size.height.max(root.scroll_height());
+                        for &child_id in root.hoisted_children.borrow().iter() {
+                            let Some(child) = self.nodes.get(child_id) else {
+                                continue;
+                            };
+                            if child
+                                .primary_styles()
+                                .is_some_and(|styles| styles.get_box().position == Position::Fixed)
+                            {
+                                continue;
+                            }
+                            let child_layout = child.final_layout();
+                            width = width.max(child_layout.location.x + child_layout.size.width);
+                            height = height.max(child_layout.location.y + child_layout.size.height);
+                        }
+                        (f64::from(width), f64::from(height))
                     }
                     None => (0.0, 0.0),
                 };
@@ -609,18 +656,22 @@ impl BaseDocument {
     fn start_scroll_animation(&mut self, target: ScrollTarget, end: Point<f64>) {
         let start = self.scroll_state(target, true).0;
 
-        let start_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64 as f64;
+        // The animation starts at the timeline sample of the frame that is
+        // running; a later resolve advances it.
+        let start_time = self.animation_time_ms;
 
-        self.scroll_animation = ScrollAnimationState::ScrollTo(ScrollToState {
+        // A smooth scroll the page asked for replaces a fling the user's touch
+        // started, so only one animation drives the document at a time.
+        self.scroll_animations.fling = None;
+        self.scroll_animations.smooth.insert(
             target,
-            start,
-            end,
-            start_time,
-            duration: Self::SMOOTH_SCROLL_DURATION_MS,
-        });
+            ScrollToState {
+                start,
+                end,
+                start_time,
+                duration: Self::SMOOTH_SCROLL_DURATION_MS,
+            },
+        );
 
         // Ensure the frame loop runs so the animation is driven to completion.
         self.request_redraw();
@@ -996,60 +1047,67 @@ impl BaseDocument {
     }
 
     pub fn resolve_scroll_animation(&mut self) {
-        match &mut self.scroll_animation {
-            ScrollAnimationState::Fling(fling_state) => {
-                let time_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64 as f64;
+        if let Some(fling_state) = self.scroll_animations.fling.clone() {
+            let time_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64 as f64;
 
-                let time_diff_ms = time_ms - fling_state.last_seen_time;
+            let time_diff_ms = time_ms - fling_state.last_seen_time;
 
-                // 0.95 @ 60fps normalized to actual frame times
-                let deceleration = 1.0 - ((0.05 / 16.66666) * time_diff_ms);
+            // 0.95 @ 60fps normalized to actual frame times
+            let deceleration = 1.0 - ((0.05 / 16.66666) * time_diff_ms);
 
-                fling_state.x_velocity *= deceleration;
-                fling_state.y_velocity *= deceleration;
-                fling_state.last_seen_time = time_ms;
-                let fling_state = fling_state.clone();
+            let x_velocity = fling_state.x_velocity * deceleration;
+            let y_velocity = fling_state.y_velocity * deceleration;
+            let fling_state = FlingState {
+                target: fling_state.target,
+                last_seen_time: time_ms,
+                x_velocity,
+                y_velocity,
+            };
 
-                let dx = fling_state.x_velocity * time_diff_ms;
-                let dy = fling_state.y_velocity * time_diff_ms;
+            let dx = fling_state.x_velocity * time_diff_ms;
+            let dy = fling_state.y_velocity * time_diff_ms;
 
-                self.scroll_chain_by(Some(fling_state.target), dx, dy, &mut |_| {});
-                if fling_state.x_velocity.abs() < 0.1 && fling_state.y_velocity.abs() < 0.1 {
-                    self.scroll_animation = ScrollAnimationState::None;
-                }
-            }
-            ScrollAnimationState::ScrollTo(scroll_to) => {
-                let scroll_to = scroll_to.clone();
-                let time_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64 as f64;
+            self.scroll_chain_by(Some(fling_state.target), dx, dy, &mut |_| {});
+            // The state advanced above, so the stored copy keeps the reduced
+            // velocity the stop test needs.
+            self.scroll_animations.fling = (fling_state.x_velocity.abs() >= 0.1
+                || fling_state.y_velocity.abs() >= 0.1)
+                .then_some(fling_state);
+        }
 
-                // Normalised progress through the animation, clamped to [0, 1].
-                let progress = if scroll_to.duration <= 0.0 {
-                    1.0
-                } else {
-                    ((time_ms - scroll_to.start_time) / scroll_to.duration).clamp(0.0, 1.0)
-                };
-                let eased = ease_in_out_cubic(progress);
+        // A smooth scroll runs on the document's animation timeline, the same
+        // clock the frame that resolves it samples
+        // (<https://drafts.csswg.org/cssom-view/#scroll-an-element>).
+        let time_ms = self.animation_time_ms;
+        // Every box animates independently; a finished one leaves the map and
+        // the rest keep going.
+        let targets: Vec<ScrollTarget> = self.scroll_animations.smooth.keys().copied().collect();
+        for target in targets {
+            let Some(scroll_to) = self.scroll_animations.smooth.get(&target).cloned() else {
+                continue;
+            };
 
-                // Interpolate the target offset and move to it.
-                let target = Point {
-                    x: scroll_to.start.x + (scroll_to.end.x - scroll_to.start.x) * eased,
-                    y: scroll_to.start.y + (scroll_to.end.y - scroll_to.start.y) * eased,
-                };
-                // TODO: dispatch `scroll` events for programmatic scrolls.
-                self.write_scroll_offset(scroll_to.target, target, &mut |_| {});
+            // Normalised progress through the animation, clamped to [0, 1].
+            let progress = if scroll_to.duration <= 0.0 {
+                1.0
+            } else {
+                ((time_ms - scroll_to.start_time) / scroll_to.duration).clamp(0.0, 1.0)
+            };
+            let eased = ease_in_out_cubic(progress);
 
-                if progress >= 1.0 {
-                    self.scroll_animation = ScrollAnimationState::None;
-                }
-            }
-            ScrollAnimationState::None => {
-                // Do nothing
+            // Interpolate the target offset and move to it.
+            let position = Point {
+                x: scroll_to.start.x + (scroll_to.end.x - scroll_to.start.x) * eased,
+                y: scroll_to.start.y + (scroll_to.end.y - scroll_to.start.y) * eased,
+            };
+            // TODO: dispatch `scroll` events for programmatic scrolls.
+            self.write_scroll_offset(target, position, &mut |_| {});
+
+            if progress >= 1.0 {
+                self.scroll_animations.smooth.remove(&target);
             }
         }
     }

@@ -8,7 +8,7 @@ use crate::net::{
     Resource, ResourceHandler, ResourceLoadResponse, StylesheetHandler, StylesheetLoader,
 };
 use crate::node::{ImageData, NodeFlags, RasterImageData, SpecialElementData, Status, TextBrush};
-use crate::scrolling::ScrollAnimationState;
+use crate::scrolling::ScrollAnimations;
 use crate::selection::TextSelection;
 use crate::stylo_device::{DeviceChanges, make_device};
 use crate::stylo_to_cursor_icon::stylo_to_cursor_icon;
@@ -408,8 +408,13 @@ pub struct BaseDocument {
     /// When each scroll container's overlay scrollbars were last shown
     /// (scrolled, or the pointer left the thumb); drives their fade-out
     pub(crate) scrollbar_activity: HashMap<NodeId, Instant>,
-    /// Whether and what kind of scroll animation is currently in progress
-    pub(crate) scroll_animation: ScrollAnimationState,
+    /// The smooth scrolls and fling currently in progress
+    pub(crate) scroll_animations: ScrollAnimations,
+    /// The document's animation timeline in milliseconds, sampled at the start
+    /// of every [`BaseDocument::resolve`] from the embedder's clock. A smooth
+    /// scroll advances on it, so it follows the same clock as frames and timers
+    /// instead of the wall clock.
+    pub(crate) animation_time_ms: f64,
 
     /// Text selection state (for non-input text)
     pub(crate) text_selection: TextSelection,
@@ -884,7 +889,8 @@ impl BaseDocument {
             drag_mode: DragMode::None,
             hovered_scrollbar: None,
             scrollbar_activity: HashMap::new(),
-            scroll_animation: ScrollAnimationState::None,
+            scroll_animations: ScrollAnimations::default(),
+            animation_time_ms: 0.0,
             text_selection: TextSelection::default(),
         };
 
@@ -3176,7 +3182,7 @@ impl BaseDocument {
             | self.has_active_animations
             | self.subdoc_is_animating
             | custom_widget_is_animating
-            | (self.scroll_animation != ScrollAnimationState::None)
+            | self.scroll_animations.is_animating()
             | self.scrollbars_animating()
     }
 

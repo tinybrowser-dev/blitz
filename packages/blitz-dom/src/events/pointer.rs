@@ -22,7 +22,7 @@ use crate::{
     BaseDocument,
     document::FocusSource,
     node::{ScrollbarRef, SpecialElementData},
-    scrolling::{FlingState, ScrollAnimationState},
+    scrolling::FlingState,
 };
 
 use super::focus::generate_focus_events;
@@ -411,7 +411,7 @@ pub(crate) fn handle_pointerdown(
     doc.last_mousedown_time = Some(Instant::now());
     doc.mousedown_position = taffy::Point { x, y };
     doc.drag_mode = DragMode::None;
-    doc.scroll_animation = ScrollAnimationState::None;
+    doc.scroll_animations.clear();
 
     let Some(hit) = doc.hit(x, y) else {
         // Clear text selection when clicking outside any element
@@ -595,7 +595,7 @@ pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
 
     if let DragMode::Panning(state) = &drag_mode {
         if let Some(fling) = state.generate_fling(time_ms) {
-            doc.scroll_animation = ScrollAnimationState::Fling(fling);
+            doc.scroll_animations.fling = Some(fling);
             doc.request_redraw();
         }
     }
