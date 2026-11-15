@@ -22,7 +22,13 @@ impl ElementCx<'_, '_> {
             .resolve_to_absolute(&current_color)
             .as_srgb_color();
         let bg_is_opaque = bg_color.components[3] >= 1.0;
-        let needs_clip = opacity < 1.0 || !bg_is_opaque;
+        // The shadow is clipped to the outside of the border box only when the
+        // element's own background cannot cover its interior. A propagated
+        // canvas background is painted before the element, so the source
+        // element must not rely on it
+        // (<https://drafts.csswg.org/css-backgrounds-3/#shadow-shape>).
+        let paints_own_background = self.context.canvas_background_id != Some(self.node.id);
+        let needs_clip = opacity < 1.0 || !bg_is_opaque || !paints_own_background;
 
         let max_shadow_rect = box_shadow.iter().fold(Rect::ZERO, |prev, shadow| {
             let x = shadow.base.horizontal.px() as f64 * self.scale;
