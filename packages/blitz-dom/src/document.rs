@@ -10,16 +10,17 @@ use crate::net::{
 use crate::node::{ImageData, NodeFlags, RasterImageData, SpecialElementData, Status, TextBrush};
 use crate::scrolling::ScrollAnimations;
 use crate::selection::TextSelection;
-use crate::stylo_device::{DeviceChanges, make_device};
+use crate::stylo::{BlitzNode, UserAgentStylesheet, init_stylo_prefs};
+use crate::stylo::{DeviceChanges, make_device, make_media_data};
 use crate::stylo_to_cursor_icon::stylo_to_cursor_icon;
 use crate::traversal::TreeTraverser;
 use crate::url::DocumentUrl;
 use crate::util::ImageType;
 use crate::{
-    DEFAULT_CSS, DocumentConfig, DocumentMutator, DummyHtmlParserProvider, ElementData,
-    EventDriver, HtmlParserProvider, Node, NodeData, NoopEventHandler, StyleThreading,
-    TextNodeData,
+    DocumentConfig, DocumentMutator, DummyHtmlParserProvider, ElementData, EventDriver,
+    HtmlParserProvider, Node, NodeData, NoopEventHandler, StyleThreading, TextNodeData,
 };
+use bitflags::bitflags;
 use blitz_traits::devtools::DevtoolSettings;
 use blitz_traits::events::{DomEvent, HitResult, UiEvent};
 use blitz_traits::navigation::{DummyNavigationProvider, NavigationProvider};
@@ -30,10 +31,7 @@ use cursor_icon::CursorIcon;
 use linebender_resource_handle::Blob;
 use markup5ever::{LocalName, local_name};
 use parley::{FontContext, PlainEditorDriver};
-use selectors::{
-    Element,
-    matching::{ElementSelectorFlags, QuirksMode},
-};
+use selectors::matching::{ElementSelectorFlags, QuirksMode};
 use smallvec::SmallVec;
 use std::any::Any;
 use std::cell::RefCell;
@@ -43,9 +41,7 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{
-    Arc, LazyLock, Mutex, MutexGuard, Once, OnceLock, RwLockReadGuard, RwLockWriteGuard,
-};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 use std::task::{Context as TaskContext, Waker};
 use style::Atom;
 use style::animation::DocumentAnimationSet;
@@ -65,7 +61,6 @@ use style::values::computed::UserSelect;
 use style::values::computed::ui::CursorKind;
 use style::{
     device::Device,
-    dom::{TDocument, TNode},
     media_queries::MediaList,
     selector_parser::SnapshotMap,
     shared_lock::{Locked, SharedRwLock, StylesheetGuards},
@@ -80,96 +75,6 @@ use web_time::Instant;
 
 #[cfg(feature = "parallel-construct")]
 use thread_local::ThreadLocal;
-
-/// A user-agent stylesheet, parsed with a read-only lock so that it can be shared between documents.
-///
-/// Documents with the same user-agent stylesheets (in the same order) also share Stylo's
-/// cached user-agent cascade data. `@import` rules are ignored.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UserAgentStylesheet(DocumentStyleSheet);
-
-pub(crate) fn init_stylo_prefs() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        style_config::set_pref!("layout.css.flexbox-balance.enabled", true);
-        // `:has()`, its relative-argument invalidations, and `:nth-child(An+B of
-        // S)` are behind style-crate prefs that default off in this build
-        // (<https://drafts.csswg.org/selectors-4/#relational>,
-        // <https://drafts.csswg.org/selectors-4/#the-nth-child-pseudo>).
-        style_config::set_pref!("layout.css.has-selector.enabled", true);
-        style_config::set_pref!("layout.css.nth-child-of.enabled", true);
-        style_config::set_pref!("layout.css.background-clip.text.enabled", true);
-        style_config::set_pref!("layout.css.webkit-text-fill-color.enabled", true);
-        style_config::set_pref!("layout.css.columns.enabled", true);
-        style_config::set_pref!("layout.css.basic-shape-shape.enabled", true);
-        style_config::set_pref!("layout.css.tree-counting-functions.enabled", true);
-        style_config::set_pref!("layout.css.progress-function.enabled", true);
-        style_config::set_pref!("layout.css.font-variations.enabled", true);
-        style_config::set_pref!("layout.css.text-indent-keywords.enabled", true);
-        style_config::set_pref!("layout.css.word-break.break-word.enabled", true);
-        #[cfg(feature = "writing-mode")]
-        {
-            style_config::set_pref!("layout.css.writing-mode.enabled", true);
-            style_config::set_pref!("layout.css.writing-mode.sideways.enabled", true);
-        }
-
-        // Properties that were previously enabled by the `layout.unimplemented` pref
-        style_config::set_pref!("layout.css.appearance.enabled", true);
-        style_config::set_pref!("layout.css.backdrop-filter.enabled", true);
-        style_config::set_pref!("layout.css.contain.enabled", true);
-        style_config::set_pref!("layout.css.content.alt-text.enabled", true);
-        style_config::set_pref!("layout.css.corner-shape.enabled", true);
-        style_config::set_pref!("layout.css.counters.enabled", true);
-        style_config::set_pref!("layout.css.font-size-adjust.enabled", true);
-        style_config::set_pref!("layout.css.forced-color-adjust.enabled", true);
-        style_config::set_pref!("layout.css.masking.enabled", true);
-        style_config::set_pref!("layout.css.math-properties.enabled", true);
-        style_config::set_pref!("layout.css.motion-path.enabled", true);
-        style_config::set_pref!("layout.css.overscroll-behavior.enabled", true);
-        style_config::set_pref!("layout.css.scroll-driven-animations.enabled", true);
-        style_config::set_pref!("layout.css.scroll-behavior.enabled", true);
-        style_config::set_pref!("layout.css.scrollbar-styling.enabled", true);
-        style_config::set_pref!("layout.css.text-decoration-inset.enabled", true);
-        style_config::set_pref!("layout.css.text-overflow.enabled", true);
-        style_config::set_pref!("layout.css.text-underline.enabled", true);
-        style_config::set_pref!("layout.css.view-transitions.enabled", true);
-        style_config::set_pref!("layout.css.writing-mode.text-orientation.enabled", true);
-        style_config::set_pref!("layout.css.zoom.enabled", true);
-        style_config::set_pref!("layout.threads", -1);
-    });
-}
-
-impl UserAgentStylesheet {
-    pub fn parse(css: &str) -> Self {
-        // Pref-gated UA declarations must be enabled before parsing.
-        init_stylo_prefs();
-
-        let lock = SharedRwLock::read_only();
-        let data = Stylesheet::from_str(
-            css,
-            DocumentUrl::default().url_extra_data(),
-            Origin::UserAgent,
-            ServoArc::new(lock.wrap(MediaList::empty())),
-            lock,
-            None,
-            None,
-            QuirksMode::NoQuirks,
-            AllowImportRules::No,
-        );
-        Self(DocumentStyleSheet(ServoArc::new(data)))
-    }
-
-    /// The default user-agent stylesheet ([`DEFAULT_CSS`]), parsed once.
-    pub fn default_sheet() -> Self {
-        static SHEET: LazyLock<UserAgentStylesheet> =
-            LazyLock::new(|| UserAgentStylesheet::parse(DEFAULT_CSS));
-        SHEET.clone()
-    }
-
-    pub fn sheet(&self) -> &DocumentStyleSheet {
-        &self.0
-    }
-}
 
 pub enum DocGuard<'a> {
     Ref(&'a BaseDocument),
@@ -324,13 +229,8 @@ pub struct BaseDocument {
     /// last [`resolve`](Self::resolve), to be applied (coalesced into a single
     /// device rebuild) at the start of the next resolve.
     pub(crate) pending_device_changes: DeviceChanges,
-    /// Whether style or layout is known to be stale. Set wherever the tree,
-    /// the stylesheets, or the device that styles are resolved against change;
-    /// cleared at the start of the resolve pass that consumes the change.
-    /// An embedder uses [`Self::needs_resolve`] to skip a `resolve` when
-    /// nothing changed, so several mutations between renders cost one settle
-    /// rather than one per mutation.
-    pub(crate) needs_resolve: bool,
+    /// Document-wide work for the next [`resolve`](Self::resolve).
+    pub(crate) flags: DocumentFlags,
     /// Strategy for Stylo's style traversal during `resolve`.
     pub(crate) style_threading: StyleThreading,
     /// Whether incremental layout is enabled for this document. When disabled,
@@ -468,8 +368,8 @@ pub struct BaseDocument {
     /// Load state (abort controller and in-flight request id) for each
     /// `<iframe>` element whose sub-document is loaded automatically
     pub(crate) iframe_loads: HashMap<NodeId, crate::iframe::IframeLoad>,
-    /// Set of changed nodes for updating the accessibility tree
-    pub(crate) changed_nodes: HashSet<NodeId>,
+    /// Whether the DOM or focus changed since the accessibility tree was last pushed
+    pub(crate) has_changes: bool,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) deferred_construction_nodes: Vec<ConstructionTask>,
 
@@ -551,6 +451,29 @@ pub struct BaseDocument {
     /// Set via [`Self::set_devtools_title`].
     #[cfg(feature = "devtools")]
     pub(crate) devtools_title: Option<String>,
+    /// Reusable buffers for document-wide passes.
+    pub(crate) scratch: DocumentScratch,
+}
+
+/// Buffers reused across runs of document-wide passes to avoid reallocating
+/// them. Recursive passes use them as stacks: each level pushes above the
+/// length it found and truncates back to it before returning.
+#[derive(Default)]
+pub(crate) struct DocumentScratch {
+    /// `(paint order, node)` pairs of the paint lists under construction in
+    /// `build_paint_tree_impl`.
+    pub(crate) keyed_children: Vec<((i32, i32), NodeId)>,
+}
+
+bitflags! {
+    /// Document-wide work for the next [`resolve`](BaseDocument::resolve).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) struct DocumentFlags: u8 {
+        /// Recompute the transform and scrollable overflow of every node, not
+        /// only of the damaged ones. Both are kept in device pixels, so a scale
+        /// change makes them stale throughout the tree.
+        const RESOLVE_ALL_TRANSFORMS = 0b0000_0001;
+    }
 }
 
 /// Whether a fetched stylesheet response is origin-clean.
@@ -721,21 +644,6 @@ impl BaseDocument {
         self.font_ctx.clone()
     }
 
-    /// Whether style or layout is stale, so the next [`Self::resolve`] would
-    /// change the rendered tree. An embedder skips the resolve when this is
-    /// false, which lets several mutations between two paints settle once.
-    pub fn needs_resolve(&self) -> bool {
-        self.needs_resolve
-    }
-
-    /// Records that style or layout is stale. Every path that invalidates the
-    /// tree calls this in addition to requesting a redraw, so a paint driven
-    /// by something other than a DOM mutation (an animation frame, a scroll)
-    /// does not force a resolve that has no work to do.
-    pub fn mark_needs_resolve(&mut self) {
-        self.needs_resolve = true;
-    }
-
     /// Asks the shell for a frame and records that the tree changed, so the
     /// frame that answers the request resolves style and layout. Document-side
     /// invalidation paths call this instead of the shell directly, so they
@@ -743,7 +651,7 @@ impl BaseDocument {
     /// holds the shell handle (a fetch response) marks the document when
     /// `handle_messages` delivers the arrival.
     pub(crate) fn request_redraw(&mut self) {
-        self.needs_resolve = true;
+        self.has_changes = true;
         self.shell_provider.request_redraw();
     }
 
@@ -833,8 +741,7 @@ impl BaseDocument {
             viewport,
             media_type,
             pending_device_changes: DeviceChanges::empty(),
-            // The initial parse populated the tree before any resolve ran.
-            needs_resolve: true,
+            flags: DocumentFlags::empty(),
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
             subdocument_depth: config.subdocument_depth,
@@ -870,7 +777,7 @@ impl BaseDocument {
             #[cfg(feature = "custom-widget")]
             pending_resource_deallocations: Vec::new(),
 
-            changed_nodes: HashSet::new(),
+            has_changes: false,
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
             pending_images: HashMap::new(),
@@ -904,6 +811,7 @@ impl BaseDocument {
             pending_animation_events: Vec::new(),
             animation_time_ms: 0.0,
             text_selection: TextSelection::default(),
+            scratch: DocumentScratch::default(),
         };
 
         // Initialise document with root Document node
@@ -1206,7 +1114,7 @@ impl BaseDocument {
             );
         if did_change {
             node.set_restyle_hint(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
-            self.needs_resolve = true;
+            self.has_changes = true;
         }
     }
 
@@ -1221,7 +1129,7 @@ impl BaseDocument {
         );
         if did_change {
             node.set_restyle_hint(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
-            self.needs_resolve = true;
+            self.has_changes = true;
         }
     }
 
@@ -1309,7 +1217,7 @@ impl BaseDocument {
             CssRuleType::Style,
         ))));
         node.set_restyle_hint(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
-        self.needs_resolve = true;
+        self.has_changes = true;
     }
 
     pub fn sub_document_node_ids(&self) -> Vec<NodeId> {
@@ -1414,15 +1322,11 @@ impl BaseDocument {
     }
 
     pub fn try_root_element(&self) -> Option<&Node> {
-        TDocument::as_node(&self.root_node()).first_element_child()
+        self.root_node().first_element_child()
     }
 
     pub fn root_element(&self) -> &Node {
-        TDocument::as_node(&self.root_node())
-            .first_element_child()
-            .unwrap()
-            .as_element()
-            .unwrap()
+        self.try_root_element().unwrap()
     }
 
     pub fn create_node(&mut self, node_data: NodeData) -> NodeId {
@@ -1433,8 +1337,7 @@ impl BaseDocument {
             .nodes
             .insert_with_key(|id| Node::new(tree_ptr, id, guard, node_data));
 
-        // Mark the new node as changed.
-        self.changed_nodes.insert(id);
+        self.has_changes = true;
         id
     }
 
@@ -1603,9 +1506,15 @@ impl BaseDocument {
         self.remove_node_from_tree(anon_id);
     }
 
-    /// Whether the document has been mutated
+    /// Whether the DOM or focus changed since the last [`Self::clear_changes`]
+    /// (i.e. whether the accessibility tree is out of date)
     pub fn has_changes(&self) -> bool {
-        self.changed_nodes.is_empty()
+        self.has_changes
+    }
+
+    /// Mark the accessibility tree as up to date
+    pub fn clear_changes(&mut self) {
+        self.has_changes = false;
     }
 
     pub fn create_text_node(&mut self, text: &str) -> NodeId {
@@ -2013,7 +1922,7 @@ impl BaseDocument {
         // this with the response URL's origin-clean flag before script runs
         // (<https://drafts.csswg.org/cssom/#concept-css-style-sheet-origin-clean-flag>).
         self.retain_cssom_sheet(stylesheet.clone(), node_id, true);
-        self.needs_resolve = true;
+        self.has_changes = true;
         let old = self.nodes_to_stylesheet.insert(node_id, stylesheet.clone());
         self.stylesheet_generation += 1;
 
@@ -2128,7 +2037,7 @@ impl BaseDocument {
             // changes style or layout. Mark the document stale even when the
             // handler itself has no message-specific invalidation, so a paint
             // never runs against the state from before the arrival.
-            self.needs_resolve = true;
+            self.has_changes = true;
             self.handle_message(msg);
         }
 
@@ -2287,6 +2196,7 @@ impl BaseDocument {
                     family_name: overrides.family_name.as_deref(),
                     weight: weight_override,
                     style: overrides.style,
+                    width: overrides.width,
                     ..Default::default()
                 };
 
@@ -2427,7 +2337,7 @@ impl BaseDocument {
             return;
         }
 
-        let opaque_node_id = TNode::opaque(&&*node);
+        let opaque_node_id = node.opaque();
         node.set_has_snapshot(true);
         node.snapshot_handled()
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2594,7 +2504,7 @@ impl BaseDocument {
                 }
                 node.mark_ancestors_dirty();
             });
-            self.needs_resolve = true;
+            self.has_changes = true;
         }
         let Some(fragment) = fragment.filter(|fragment| !fragment.is_empty()) else {
             return;
@@ -2609,7 +2519,7 @@ impl BaseDocument {
             node.mark_ancestors_dirty();
         });
         self.url_target = Some(target);
-        self.needs_resolve = true;
+        self.has_changes = true;
     }
 
     /// The element a fragment names: its ID first, then an `a` element whose
@@ -2687,9 +2597,7 @@ impl BaseDocument {
         if x < 0.0 || y < 0.0 || x > viewport_width || y > viewport_height {
             return Vec::new();
         }
-        if TDocument::as_node(&self.root_node())
-            .first_element_child()
-            .is_none()
+        if self.root_node().first_element_child().is_none()
         {
             return Vec::new();
         }
@@ -2796,7 +2704,8 @@ impl BaseDocument {
                 });
             }
             self.focus_node_id = None;
-            self.request_redraw();
+            self.has_changes = true;
+            self.shell_provider.request_redraw();
         }
     }
 
@@ -2879,6 +2788,7 @@ impl BaseDocument {
         }
 
         self.focus_node_id = Some(focus_node_id);
+        self.has_changes = true;
 
         // The focus is styled (:focus, :focus-visible, :focus-within), so
         // moving it changes what is on screen. Nothing else asks for the
@@ -2988,10 +2898,7 @@ impl BaseDocument {
         x: f32,
         y: f32,
     ) -> (Option<HitResult>, Option<crate::node::ScrollbarRef>) {
-        if TDocument::as_node(&self.root_node())
-            .first_element_child()
-            .is_none()
-        {
+        if self.root_node().first_element_child().is_none() {
             #[cfg(feature = "tracing")]
             tracing::warn!("No DOM - not resolving hit test");
             return (None, None);
@@ -3272,25 +3179,29 @@ impl BaseDocument {
         self.request_redraw();
     }
 
-    /// Apply any pending device changes to the stylist, coalescing all changes
-    /// since the last flush into a single device rebuild.
+    /// Apply any pending device changes to the stylist's device, coalescing all
+    /// changes since the last flush into a single update of its [`MediaData`](style::device::servo::MediaData).
     pub(crate) fn flush_pending_device_changes(&mut self) {
         let changes = std::mem::take(&mut self.pending_device_changes);
         if changes.is_empty() {
             return;
         }
 
-        self.set_stylist_device(make_device(
-            &self.viewport,
-            self.media_type.clone(),
-            self.font_ctx.clone(),
-        ));
+        let media_data = make_media_data(&self.viewport, self.media_type.clone());
+        let device = self.stylist.device_mut();
+        let old_viewport_size = device.au_viewport_size();
+        device.set_media_data(media_data);
+        let viewport_units_changed =
+            old_viewport_size != device.au_viewport_size() && device.used_viewport_size();
+        self.restyle_for_device_change(viewport_units_changed);
         self.scroll_viewport_by(0.0, 0.0); // Clamp scroll offset
 
         // Text is shaped at a specific scale factor, so cached inline layouts
-        // must be invalidated when the scale changes.
+        // must be invalidated when the scale changes, as must every node's
+        // transform and scrollable overflow (kept in device pixels).
         if changes.contains(DeviceChanges::SCALE) {
             self.invalidate_inline_contexts();
+            self.flags.insert(DocumentFlags::RESOLVE_ALL_TRANSFORMS);
         }
 
         // Color-scheme changes affect values that are resolved at cascade time
@@ -3327,17 +3238,24 @@ impl BaseDocument {
         }
         drop(root_styles);
 
-        let old_device = self.stylist.device();
-        let viewport_size_changed = old_device.au_viewport_size() != device.au_viewport_size();
-        let styles_use_viewport_units = old_device.used_viewport_size();
+        let viewport_size_changed =
+            self.stylist.device().au_viewport_size() != device.au_viewport_size();
+        let styles_used_viewport_units = self.stylist.device().used_viewport_size();
+        *self.stylist.device_mut() = device;
+        self.restyle_for_device_change(viewport_size_changed && styles_used_viewport_units);
+    }
 
+    /// Invalidate the styles that a change to the stylist's device affects.
+    /// `viewport_units_changed` is whether styles that used viewport units need recomputing.
+    fn restyle_for_device_change(&mut self, viewport_units_changed: bool) {
         let origins = {
             let guard = &self.guard;
             let guards = StylesheetGuards {
                 author: &guard.read(),
                 ua_or_user: &guard.read(),
             };
-            self.stylist.set_device(device, &guards)
+            self.stylist
+                .media_features_change_changed_style(&guards, self.stylist.device())
         };
 
         // Only fully invalidate element styles when the media query results of
@@ -3352,7 +3270,7 @@ impl BaseDocument {
         // when the viewport size changes, even if no media query results
         // changed. Invalidate just the elements whose styles use viewport
         // units (tracked via per-element computed value flags).
-        if viewport_size_changed && styles_use_viewport_units {
+        if viewport_units_changed {
             if self
                 .stylist
                 .get_custom_property_initial_values_flags()
@@ -3361,7 +3279,7 @@ impl BaseDocument {
                 self.stylist.rebuild_initial_values_for_custom_properties();
             }
             if let Some(root) = self.try_root_element() {
-                style::invalidation::viewport_units::invalidate(root);
+                style::invalidation::viewport_units::invalidate(BlitzNode(root));
             }
         }
     }
@@ -3422,7 +3340,7 @@ impl BaseDocument {
         // (such as `<a>`) between them.
         let mut maybe_node = Some(node);
         while let Some(node) = maybe_node {
-            if node.is_link() {
+            if node.data.is_element_with_tag_name(&local_name!("a")) {
                 return Some(CursorIcon::Pointer);
             }
 
@@ -3714,11 +3632,7 @@ impl BaseDocument {
             let Some(element) = node.element_data() else {
                 return false;
             };
-            if element.name.local == local_name!("canvas") && element.has_attr(local_name!("src")) {
-                return true;
-            }
-
-            false
+            element.name.local == local_name!("canvas") && element.has_attr(local_name!("src"))
         })
     }
 
@@ -3872,7 +3786,12 @@ impl BaseDocument {
             if !result.is_empty() {
                 result.push(' ');
             }
-            result.push_str(&inline_layout.text[*start..*end]);
+            let text = &inline_layout.text[*start..*end];
+            result.extend(
+                text.char_indices()
+                    .filter(|&(i, _)| !inline_layout.is_inline_box_char(start + i))
+                    .map(|(_, c)| c),
+            );
         }
 
         if result.is_empty() {
@@ -4940,6 +4859,7 @@ mod font_face_override_tests {
                     family_name: Some(String::from(ALIAS)),
                     weight: Some(800.0),
                     style: Some(parley::fontique::FontStyle::Italic),
+                    width: None,
                 },
             )),
         };
@@ -4961,6 +4881,47 @@ mod font_face_override_tests {
             "registered family should report the CSS-declared name, \
              not the font file's internal `name` table entry",
         );
+    }
+}
+
+#[cfg(test)]
+mod change_tracking_tests {
+    use super::*;
+    use crate::qual_name;
+    use blitz_traits::shell::ColorScheme;
+
+    #[test]
+    fn mutations_and_focus_changes_are_tracked() {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        let root_id = doc.root_node().id;
+        let mut mutator = doc.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![]);
+        let body = mutator.create_element(qual_name!("body"), vec![]);
+        let button = mutator.create_element(qual_name!("button"), vec![]);
+        mutator.append_children(body, &[button]);
+        mutator.append_children(html, &[body]);
+        mutator.append_children(root_id, &[html]);
+        drop(mutator);
+        doc.resolve(0.0);
+        assert!(
+            !doc.has_changes(),
+            "a resolve consumes the pending changes"
+        );
+
+        doc.mutate()
+            .set_attribute(button, qual_name!("aria-label"), "Submit");
+        assert!(doc.has_changes());
+
+        doc.clear_changes();
+        assert!(doc.set_focus_to(button));
+        assert!(doc.has_changes());
+
+        doc.clear_changes();
+        doc.clear_focus();
+        assert!(doc.has_changes());
     }
 }
 

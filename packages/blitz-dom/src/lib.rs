@@ -72,7 +72,6 @@ mod sheet_images;
 pub mod srcset;
 /// Implementations that interact with servo's style engine
 mod stylo;
-mod stylo_device;
 mod stylo_to_cursor_icon;
 mod stylo_to_kurbo;
 mod stylo_to_parley;
@@ -109,7 +108,7 @@ pub use config::{DocumentConfig, StyleThreading};
 pub use document::{
     BaseDocument, BoundingRect, DocGuard, DocGuardMut, Document, FocusSource, ImageKey,
     ImageOutcome, ImageRequestState, ImageRequestStatus, ImageSettleObserver, ImageSettlement,
-    PlainDocument, UserAgentStylesheet,
+    PlainDocument,
 };
 pub use markup5ever::{
     LocalName, Namespace, NamespaceStaticSet, Prefix, PrefixStaticSet, QualName, local_name,
@@ -125,6 +124,7 @@ pub use scrolling::{
     ScrollIntoViewContainer, ScrollLogicalPosition,
 };
 pub use selectors::matching::QuirksMode as StyleQuirksMode;
+pub use stylo::UserAgentStylesheet;
 pub use tree::NodeTree;
 
 /// Convert a Blitz [`NodeId`] into a [`taffy::NodeId`] (which wraps a `u64`).

@@ -5,7 +5,8 @@ use stylo_taffy::CopyStyleGetters;
 
 use crate::document::ImageKey;
 use crate::net::ResourceHandler;
-use crate::node::{Node, NodeFlags};
+use crate::node::NodeFlags;
+use crate::stylo::BlitzNode;
 use crate::tree::NodeTree;
 use crate::{
     BaseDocument, net::ImageHandler, node::ImageResourceData, node::Status, util::ImageLayerKind,
@@ -223,7 +224,7 @@ impl BaseDocument {
             };
             let read_guard = self.guard.read();
             let guards = StylesheetGuards::same(&read_guard);
-            self.stylist.style_for_anonymous::<&Node>(
+            self.stylist.style_for_anonymous::<BlitzNode>(
                 &guards,
                 &PseudoElement::ServoAnonymousBox,
                 &parent_style,
@@ -248,7 +249,7 @@ impl BaseDocument {
                 };
 
                 // Compute precise damage, retaining the old style allocation if unchanged.
-                let diff = RestyleDamage::compute_style_difference::<&Node>(old_style, &style);
+                let diff = RestyleDamage::compute_style_difference::<BlitzNode>(old_style, &style);
                 let changed = matches!(diff.change, StyleChange::Changed { .. });
                 if changed {
                     data.styles.primary = Some(style.clone());
@@ -422,11 +423,7 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
             }
         }
 
-        if new.is_pseudo_style() && old.get_counters().content != new.get_counters().content {
-            return true;
-        }
-
-        false
+        new.is_pseudo_style() && old.get_counters().content != new.get_counters().content
     };
 
     let text_shaping_needs_recollect = || {
@@ -438,7 +435,7 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
 
         let old_text = old.get_inherited_text();
         let new_text = new.get_inherited_text();
-        if !std::ptr::eq(old_text, new_text)
+        !std::ptr::eq(old_text, new_text)
             && (old_text.white_space_collapse != new_text.white_space_collapse
                 || old_text.text_transform != new_text.text_transform
                 || old_text.word_break != new_text.word_break
@@ -447,11 +444,6 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
                 || old_text.letter_spacing != new_text.letter_spacing
                 || old_text.word_spacing != new_text.word_spacing
                 || old_text.text_rendering != new_text.text_rendering)
-        {
-            return true;
-        }
-
-        false
     };
 
     // Table layout bakes the sizes of the table and its internal boxes into the table
@@ -515,7 +507,7 @@ pub(crate) fn sort_layout_children_by_order(
 
 impl BaseDocument {
     pub(crate) fn invalidate_inline_contexts(&mut self) {
-        self.needs_resolve = true;
+        self.has_changes = true;
         let scale = self.viewport.scale();
 
         let font_ctx = &self.font_ctx;

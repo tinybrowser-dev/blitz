@@ -705,7 +705,7 @@ impl BaseDocument {
                 record.live = adopted.contains(&record.sheet);
             }
         }
-        self.needs_resolve = true;
+        self.has_changes = true;
         true
     }
 

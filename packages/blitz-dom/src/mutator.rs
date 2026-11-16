@@ -3,7 +3,7 @@ use blitz_traits::devtools::{
     AttributeChanged, CharacterDataChanged, MutationRecord, NodeInserted, NodeRemoved,
 };
 use blitz_traits::node_id::NodeId;
-use markup5ever::LocalName;
+use markup5ever::{LocalName, ns};
 use std::collections::HashSet;
 use std::mem;
 use std::ops::{Deref, DerefMut, Range};
@@ -12,7 +12,7 @@ use crate::document::{ImageKey, ImageOutcome, ImageRequestState, ImageRequestSta
 use crate::layout::damage::ALL_DAMAGE;
 use crate::net::{ImageHandler, ResourceHandler};
 use crate::node::{CanvasData, Dirtiness, ImageData, NodeFlags, SpecialElementData};
-use crate::stylo_device::DeviceChanges;
+use crate::stylo::DeviceChanges;
 use crate::util::ImageType;
 use crate::{
     Attribute, BaseDocument, Document, ElementData, Node, NodeData, QualName, local_name, qual_name,
@@ -110,7 +110,8 @@ impl Drop for DocumentMutator<'_> {
     fn drop(&mut self) {
         self.flush(); // Defined at bottom of file
         if self.mutations_occurred {
-            self.doc.request_redraw();
+            self.doc.has_changes = true;
+            self.doc.shell_provider.request_redraw();
         }
     }
 }
@@ -557,6 +558,7 @@ impl DocumentMutator<'_> {
         }
 
         element.attrs.set(name.clone(), value);
+        element.presentational_hints.take();
         if no_namespace && refresh_placeholder && name.local != local_name!("value") {
             element.sync_placeholder_shown(textarea_text_empty);
         }
@@ -727,7 +729,14 @@ impl DocumentMutator<'_> {
             return;
         }
 
-        if (tag, attr) == tag_and_attr!("canvas", "src") {
+        if (tag, attr) == tag_and_attr!("img", "src")
+            || (cfg!(feature = "svg")
+                && element.name.ns == ns!(svg)
+                && matches!(&**tag, "image" | "feImage")
+                && *attr == local_name!("href"))
+        {
+            self.load_image(node_id, ImageMutation::Src);
+        } else if (tag, attr) == tag_and_attr!("canvas", "src") {
             self.load_custom_paint_src(node_id);
         } else if (tag, attr) == tag_and_attr!("link", "href")
             || (tag, attr) == tag_and_attr!("link", "rel")
@@ -785,6 +794,7 @@ impl DocumentMutator<'_> {
         if !had_attr {
             return;
         }
+        element.presentational_hints.take();
         self.mutations_occurred |= node_is_in_document;
         if node_is_in_document {
             devtools!(
@@ -1750,6 +1760,9 @@ impl<'doc> DocumentMutator<'doc> {
                     self.eager_op_queue.push(SpecialOp::LoadStylesheet(node_id))
                 }
                 "img" => self.eager_op_queue.push(SpecialOp::LoadImage(node_id)),
+                "image" | "feImage" if cfg!(feature = "svg") && element.name.ns == ns!(svg) => {
+                    self.eager_op_queue.push(SpecialOp::LoadImage(node_id))
+                }
                 "iframe" => self.eager_op_queue.push(SpecialOp::LoadIframe(node_id)),
                 "canvas" => self
                     .eager_op_queue
@@ -1809,7 +1822,7 @@ impl<'doc> DocumentMutator<'doc> {
             // Remove any snapshot for this node to prevent stale snapshot references
             // during style invalidation.
             if node.has_snapshot() {
-                let opaque_id = style::dom::TNode::opaque(&&*node);
+                let opaque_id = node.opaque();
                 doc.snapshots.remove(&opaque_id);
                 node.set_has_snapshot(false);
             }
@@ -2032,7 +2045,10 @@ impl<'doc> DocumentMutator<'doc> {
         let (Some(rels), Some(href)) = (rel_attr, href_attr) else {
             return;
         };
-        if !rels.split_ascii_whitespace().any(|rel| rel == "stylesheet") {
+        if !rels
+            .split_ascii_whitespace()
+            .any(|rel| rel.eq_ignore_ascii_case("stylesheet"))
+        {
             return;
         }
 
@@ -2107,8 +2123,14 @@ impl<'doc> DocumentMutator<'doc> {
         let Some(element) = node.element_data_mut() else {
             unreachable!();
         };
-        let SpecialElementData::Stylesheet(stylesheet) = element.special_data.take() else {
-            unreachable!();
+        // An icon link never holds a stylesheet, and a stylesheet link holds none
+        // until its fetch has completed.
+        let stylesheet = match element.special_data.take() {
+            SpecialElementData::Stylesheet(stylesheet) => stylesheet,
+            other => {
+                element.special_data = other;
+                return;
+            }
         };
 
         let guard = self.doc.guard.read();
@@ -2148,7 +2170,18 @@ impl<'doc> DocumentMutator<'doc> {
 
     pub(crate) fn load_image(&mut self, target_id: NodeId, mutation: ImageMutation) {
         let node = &self.doc.nodes[target_id];
-        let raw_src = node.attr(local_name!("src"));
+        // An SVG `<image>`/`<feImage>` names its source with `href`, and usvg
+        // resolves `data:` URLs and `#fragment` references itself, so those
+        // never reach the network.
+        let svg_href = node.element_data().and_then(|element| {
+            if element.name.ns != ns!(svg) {
+                return None;
+            }
+            element
+                .svg_href()
+                .filter(|href| !href.starts_with('#') && !is_data_url(href))
+        });
+        let raw_src = svg_href.or_else(|| node.attr(local_name!("src")));
         let raw_srcset = node.attr(local_name!("srcset"));
         let has_source_set = raw_srcset.is_some_and(|set| !set.trim().is_empty())
             || node.parent.is_some_and(|parent| {
@@ -2490,6 +2523,13 @@ impl<'doc> DocumentMutator<'doc> {
     }
 }
 
+/// Whether `url` is a `data:` URL, which never reaches the network.
+fn is_data_url(url: &str) -> bool {
+    url.trim_start()
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+}
+
 /// Type that allows mutable access to the viewport
 /// And syncs it back to stylist on drop.
 pub struct ViewportMut<'doc> {
@@ -2571,6 +2611,42 @@ mod test {
         mutator.append_children(html, &[img, link]);
         mutator.append_children(root_id, &[html]);
         mutator.set_attribute(img, qual_name!("src"), "other.png");
+        drop(mutator);
+
+        document.resolve(0.0);
+    }
+
+    #[test]
+    fn removing_href_from_a_link_without_a_loaded_stylesheet() {
+        // An icon link never holds a stylesheet, and a stylesheet link holds none
+        // until its fetch completes (here it never starts, as the url is unresolvable).
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root_id = document.root_node().id;
+        let attr = |name, value: &str| Attribute {
+            name,
+            value: value.to_string(),
+        };
+
+        let mut mutator = document.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![]);
+        let icon = mutator.create_element(
+            qual_name!("link"),
+            vec![
+                attr(qual_name!("rel"), "icon"),
+                attr(qual_name!("href"), "favicon.png"),
+            ],
+        );
+        let stylesheet = mutator.create_element(
+            qual_name!("link"),
+            vec![
+                attr(qual_name!("rel"), "stylesheet"),
+                attr(qual_name!("href"), "style.css"),
+            ],
+        );
+        mutator.append_children(html, &[icon, stylesheet]);
+        mutator.append_children(root_id, &[html]);
+        mutator.clear_attribute(icon, qual_name!("href"));
+        mutator.clear_attribute(stylesheet, qual_name!("href"));
         drop(mutator);
 
         document.resolve(0.0);

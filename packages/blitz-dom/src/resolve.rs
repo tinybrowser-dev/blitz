@@ -6,8 +6,6 @@ use std::cell::RefCell;
 use debug_timer::debug_timer;
 use kurbo::{Affine, Rect};
 use parley::LayoutContext;
-use selectors::Element as _;
-use style::dom::TDocument;
 
 #[cfg(feature = "parallel-construct")]
 use rayon::prelude::*;
@@ -22,6 +20,7 @@ use taffy::AvailableSpace;
 
 use crate::{
     BaseDocument,
+    document::DocumentFlags,
     layout::{
         LayoutPassState,
         construct::{
@@ -37,10 +36,7 @@ use crate::{
 impl BaseDocument {
     /// Restyle the tree and then relayout it
     pub fn resolve(&mut self, current_time_for_animations: f64) {
-        if TDocument::as_node(&self.root_node())
-            .first_element_child()
-            .is_none()
-        {
+        if self.root_node().first_element_child().is_none() {
             #[cfg(feature = "tracing")]
             tracing::warn!("No DOM - not resolving");
             return;
@@ -87,8 +83,9 @@ impl BaseDocument {
         // This pass now consumes every invalidation recorded so far, including
         // the scale-change invalidation the flush above can raise. A change
         // made *during* the rest of the pass (hover re-resolution, a message
-        // handled mid-resolve) sets the flag again for the next pass.
-        self.needs_resolve = false;
+        // handled mid-resolve) sets the flag again for the next pass, so an
+        // animation or a resource arrival is never dropped.
+        self.has_changes = false;
 
         // we need to resolve stylist first since it will need to drive our layout bits
         self.resolve_stylist(current_time_for_animations);
@@ -125,7 +122,9 @@ impl BaseDocument {
         self.nodes.bump_geometry_generation();
 
         // Resolve transforms
-        self.resolve_transforms(root_node_id);
+        let resolve_all = self.flags.contains(DocumentFlags::RESOLVE_ALL_TRANSFORMS);
+        self.flags.remove(DocumentFlags::RESOLVE_ALL_TRANSFORMS);
+        self.resolve_transforms(root_node_id, resolve_all);
         timer.record_time("transform");
 
         // Build paint children / stacking contexts for damaged subtrees. Runs
@@ -179,23 +178,28 @@ impl BaseDocument {
         // An animation or a smooth scroll needs another pass even though no
         // mutation will ask for one; the frame loop calls resolve directly.
         if self.is_animating() {
-            self.needs_resolve = true;
+            self.has_changes = true;
         }
 
         timer.print_times(&format!("Resolve({}): ", self.id()));
     }
 
-    fn resolve_transforms(&mut self, node_id: NodeId) -> Rect {
+    fn resolve_transforms(&mut self, node_id: NodeId, resolve_all: bool) -> Rect {
         if !self.nodes.contains_key(node_id) {
             return Rect::ZERO;
         }
 
         let scale = self.viewport.scale_f64();
 
-        if !self.nodes[node_id]
-            .damage()
-            .map(|d| d.contains(style::selector_parser::RestyleDamage::RECALCULATE_OVERFLOW))
-            .unwrap_or(false)
+        // Anonymous boxes are never skipped: damage marking walks the DOM
+        // parent chain, which bypasses them, so a damaged descendant may be
+        // reachable only through an undamaged anonymous box.
+        if !resolve_all
+            && !self.nodes[node_id].is_anonymous()
+            && !self.nodes[node_id]
+                .damage()
+                .map(|d| d.contains(style::selector_parser::RestyleDamage::RECALCULATE_OVERFLOW))
+                .unwrap_or(false)
         {
             let node = &self.nodes[node_id];
             let location = node.final_layout().location.map(|v| v as f64 * scale);
@@ -225,7 +229,7 @@ impl BaseDocument {
                 if self.nodes[child_id].is_out_of_flow() {
                     continue;
                 }
-                let child_rect_in_self = self.resolve_transforms(child_id);
+                let child_rect_in_self = self.resolve_transforms(child_id, resolve_all);
                 overflow = overflow.union(child_rect_in_self);
             }
         }
@@ -235,7 +239,7 @@ impl BaseDocument {
             if !self.nodes.contains_key(child_id) {
                 continue;
             }
-            let child_rect_in_self = self.resolve_transforms(child_id);
+            let child_rect_in_self = self.resolve_transforms(child_id, resolve_all);
             overflow = overflow.union(child_rect_in_self);
         }
         *self.nodes[node_id].hoisted_children.borrow_mut() = hoisted_children;
@@ -244,7 +248,7 @@ impl BaseDocument {
             if self.nodes[pseudo].is_out_of_flow() {
                 continue;
             }
-            let child_rect_in_self = self.resolve_transforms(pseudo);
+            let child_rect_in_self = self.resolve_transforms(pseudo, resolve_all);
             overflow = overflow.union(child_rect_in_self);
         }
 
