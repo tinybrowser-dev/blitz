@@ -368,7 +368,11 @@ pub struct BaseDocument {
     /// Load state (abort controller and in-flight request id) for each
     /// `<iframe>` element whose sub-document is loaded automatically
     pub(crate) iframe_loads: HashMap<NodeId, crate::iframe::IframeLoad>,
-    /// Whether the DOM or focus changed since the accessibility tree was last pushed
+    /// Whether style or layout is stale: set by every path that invalidates
+    /// the tree, and cleared by the resolve pass that consumes it. An embedder
+    /// reads it to skip a resolve when nothing changed, so several mutations
+    /// between two paints cost one settle. `resolve` clears it at the start of
+    /// a pass.
     pub(crate) has_changes: bool,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) deferred_construction_nodes: Vec<ConstructionTask>,
@@ -1506,13 +1510,16 @@ impl BaseDocument {
         self.remove_node_from_tree(anon_id);
     }
 
-    /// Whether the DOM or focus changed since the last [`Self::clear_changes`]
-    /// (i.e. whether the accessibility tree is out of date)
+    /// Whether the tree has pending style or layout work. [`Self::resolve`]
+    /// consumes the flag at the start of a pass, so a change made while that
+    /// pass runs is still reported afterwards.
     pub fn has_changes(&self) -> bool {
         self.has_changes
     }
 
-    /// Mark the accessibility tree as up to date
+    /// Forgets pending work without resolving it. An embedder that owns the
+    /// frame loop uses this only when it discards the frame, since a plain
+    /// `resolve` already consumes the flag.
     pub fn clear_changes(&mut self) {
         self.has_changes = false;
     }
