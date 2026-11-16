@@ -1546,11 +1546,10 @@ fn canvas_background_node<'a>(dom: &'a BaseDocument, root_id: Option<NodeId>) ->
             .unwrap_or(root)
     };
     // An element that generates no box paints no background, so the canvas
-    // stays transparent (<https://drafts.csswg.org/css-backgrounds-3/#special-backgrounds>).
-    let generates_box = node
-        .primary_styles()
-        .is_some_and(|style| style.clone_display().inside() != DisplayInside::None);
-    generates_box.then_some(node)
+    // stays transparent. `display: contents` generates no box of its own, so
+    // the body's background neither propagates to the canvas nor paints
+    // (<https://drafts.csswg.org/css-backgrounds-3/#special-backgrounds>).
+    node.has_boxes().then_some(node)
 }
 
 /// Whether `node`'s own background covers the canvas: it has a background

@@ -148,8 +148,11 @@ impl ElementCx<'_, '_> {
         if text_run {
             self.begin_text_clip_group(scene);
         }
-        // The canvas already paints this element's background color.
-        if self.context.canvas_background_node_id != Some(self.node.id) {
+        // The canvas pass paints this element's background color over the whole
+        // canvas; the element pass skips this element's background entirely
+        // (see `canvas_background_node_id` in `render.rs`), so the color is
+        // painted exactly once.
+        if canvas || self.context.canvas_background_node_id != Some(self.node.id) {
             self.draw_solid_bg(scene, &background_clip_path);
         }
 
