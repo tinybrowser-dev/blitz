@@ -64,7 +64,10 @@ use style::{
     media_queries::MediaList,
     selector_parser::SnapshotMap,
     shared_lock::{Locked, SharedRwLock, StylesheetGuards},
-    stylesheets::{AllowImportRules, CssRuleType, DocumentStyleSheet, Origin, Stylesheet},
+    stylesheets::{
+        AllowImportRules, CssRule, CssRuleType, DocumentStyleSheet, FontFaceRule, Origin,
+        Stylesheet, StylesheetInDocument,
+    },
     stylist::Stylist,
 };
 use style_dom::ElementState;
@@ -319,6 +322,11 @@ pub struct BaseDocument {
     /// observed, waiting for the embedder to fire them in the document's
     /// realm (<https://drafts.csswg.org/css-animations-1/#events>).
     pub(crate) pending_animation_events: Vec<crate::animation_events::PendingAnimationEvent>,
+    /// The `@font-face` rules whose source list settled since the last
+    /// drain, waiting for the embedder to settle its `FontFace` objects and
+    /// resolve `document.fonts.ready`
+    /// (<https://drafts.csswg.org/css-font-loading/#dom-fontface-status>).
+    pub(crate) pending_font_face_events: Vec<crate::font_face_events::PendingFontFaceEvent>,
     /// The document's animation timeline in milliseconds, sampled at the start
     /// of every [`BaseDocument::resolve`] from the embedder's clock. A smooth
     /// scroll advances on it, so it follows the same clock as frames and timers
@@ -388,7 +396,8 @@ pub struct BaseDocument {
     /// one URL with different `crossorigin` values are different requests. Each
     /// entry keeps the response taint, so a node answered from the cache gets
     /// the taint its own request would have carried.
-    pub(crate) image_cache: HashMap<Url, HashMap<Option<blitz_traits::net::CorsSetting>, CachedImage>>,
+    pub(crate) image_cache:
+        HashMap<Url, HashMap<Option<blitz_traits::net::CorsSetting>, CachedImage>>,
 
     /// In-flight image requests, keyed like [`BaseDocument::image_cache`].
     pub(crate) pending_images:
@@ -813,6 +822,7 @@ impl BaseDocument {
             pending_scrolls: Vec::new(),
             pending_scrollends: Vec::new(),
             pending_animation_events: Vec::new(),
+            pending_font_face_events: Vec::new(),
             animation_time_ms: 0.0,
             text_selection: TextSelection::default(),
             scratch: DocumentScratch::default(),
@@ -1938,16 +1948,7 @@ impl BaseDocument {
         }
 
         // Fetch @font-face fonts
-        crate::net::fetch_font_face(
-            self.tx.clone(),
-            self.id,
-            Some(node_id),
-            &stylesheet.0,
-            &self.net_provider,
-            &self.shell_provider,
-            &self.guard.read(),
-            self.abort_signal.as_ref(),
-        );
+        self.load_sheet_font_faces(&stylesheet, Some(node_id));
 
         // Store data on element. A processing instruction owns its sheet
         // without element storage; the owner map still records its tree
@@ -2090,6 +2091,128 @@ impl BaseDocument {
         self.parse_errors.push(msg);
     }
 
+    /// Starts the `@font-face` loads of every font-face rule in `sheet`
+    /// (<https://drafts.csswg.org/css-fonts-4/#font-face-rule-processing>).
+    /// The sheet's location is the referrer for every font it names, and its
+    /// response carried the policy the embedder applies
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+    fn load_sheet_font_faces(&mut self, sheet: &DocumentStyleSheet, node_id: Option<NodeId>) {
+        let keys: Vec<crate::net::FontFaceLoadKey> = {
+            let guard = self.guard.read();
+            let contents = sheet.contents(&guard);
+            let sheet_url = Some(contents.url_data.0.as_ref().clone());
+            contents
+                .rules(&guard)
+                .iter()
+                .filter_map(|rule| match rule {
+                    CssRule::FontFace(rule) => Some(crate::net::FontFaceLoadKey {
+                        rule: rule.clone(),
+                        sheet_url: sheet_url.clone(),
+                        source_index: 0,
+                    }),
+                    _ => None,
+                })
+                .collect()
+        };
+        for key in keys {
+            self.load_font_face_sources(key, node_id);
+        }
+    }
+
+    /// Starts the `@font-face` load of one rule the CSSOM inserted, which no
+    /// sheet walk would find. The rule carries its own source list; the
+    /// document's referrer and policy apply when the owning sheet is not
+    /// reachable (`insertRule` on a linked sheet is the uncovered case).
+    pub(crate) fn load_font_face_rule(
+        &mut self,
+        rule: &ServoArc<Locked<FontFaceRule>>,
+        sheet_url: Option<url::Url>,
+        node_id: Option<NodeId>,
+    ) {
+        self.load_font_face_sources(
+            crate::net::FontFaceLoadKey {
+                rule: rule.clone(),
+                sheet_url,
+                source_index: 0,
+            },
+            node_id,
+        );
+    }
+
+    /// Walks `key.rule`'s `src` list from `key.source_index`
+    /// (<https://drafts.csswg.org/css-fonts-4/#src-desc>): a source that
+    /// cannot name a font — a `local()` family (see
+    /// [`crate::net::FontFaceSourceEntry`]), an unsupported format, an
+    /// unresolvable url — is skipped, a `url()` source starts a fetch whose
+    /// response re-enters this walk at the next index, and a list that runs
+    /// out settles the rule as an error.
+    fn load_font_face_sources(
+        &mut self,
+        key: crate::net::FontFaceLoadKey,
+        node_id: Option<NodeId>,
+    ) {
+        // The list's length bounds the walk: an entry past the end means the
+        // list ran out (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+        let source_count = {
+            let guard = self.guard.read();
+            key.rule
+                .read_with(&guard)
+                .descriptors
+                .src
+                .as_ref()
+                .map_or(0, |list| list.0.len())
+        };
+        for index in key.source_index..source_count {
+            let source = {
+                let guard = self.guard.read();
+                crate::net::font_face_source(&key.rule, &guard, index)
+            };
+            let Some(source) = source else { continue };
+            let crate::net::FontFaceSourceEntry::Url(url, format) = source;
+            let overrides = {
+                let guard = self.guard.read();
+                crate::net::font_face_overrides(&key.rule, &guard)
+            };
+            let Some(overrides) = overrides else {
+                // A rule with no family to alias the bytes under (an
+                // unquoted generic keyword in `font-family`, which stylo
+                // records as no family) cannot register a face from any
+                // source: the rule settles as an error, rather than leaving a
+                // face the embedder creates from it waiting forever
+                // (<https://drafts.csswg.org/css-fonts-4/#font-family-desc>).
+                self.pending_font_face_events
+                    .push(crate::font_face_events::PendingFontFaceEvent {
+                        rule: key.rule.clone(),
+                        status: crate::font_face_events::FontFaceLoadStatus::Error,
+                        url: None,
+                    });
+                return;
+            };
+            crate::net::fetch_font_face_source(
+                crate::net::FontFaceLoadKey {
+                    source_index: index,
+                    ..key
+                },
+                url,
+                format,
+                overrides,
+                self.tx.clone(),
+                self.id(),
+                node_id,
+                &self.net_provider,
+                &self.shell_provider,
+                self.abort_signal.as_ref(),
+            );
+            return;
+        }
+        self.pending_font_face_events
+            .push(crate::font_face_events::PendingFontFaceEvent {
+                rule: key.rule.clone(),
+                status: crate::font_face_events::FontFaceLoadStatus::Error,
+                url: None,
+            });
+    }
+
     pub fn load_resource(&mut self, res: ResourceLoadResponse) {
         self.pending_critical_resources.remove(&res.request_id);
 
@@ -2104,13 +2227,28 @@ impl BaseDocument {
                 // its own.
                 if let Some(key) = res.image_key.as_ref() {
                     let waiters = self.take_pending(key);
-                    let final_url = res.resolved_url.as_deref().and_then(|url| Url::parse(url).ok());
+                    let final_url = res
+                        .resolved_url
+                        .as_deref()
+                        .and_then(|url| Url::parse(url).ok());
                     for (node, image_type) in waiters {
                         if matches!(image_type, ImageType::Image) {
                             self.fail_image_request(node, final_url.clone());
                             self.notify_image_settled(node, ImageOutcome::Failed);
                         }
                     }
+                }
+                // A font source whose fetch failed moves the rule's source
+                // list to the next source
+                // (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+                if let Some(key) = res.font_face {
+                    self.load_font_face_sources(
+                        crate::net::FontFaceLoadKey {
+                            source_index: key.source_index + 1,
+                            ..key
+                        },
+                        res.node_id,
+                    );
                 }
                 #[cfg(feature = "tracing")]
                 tracing::warn!(
@@ -2158,10 +2296,13 @@ impl BaseDocument {
                 self.record_sheet_images(&sheet, res.resolved_url.as_deref());
                 let mut guard = self.guard.write();
                 import_rule.write_with(&mut guard).stylesheet =
-                    style::stylesheets::import_rule::ImportSheet::Sheet(sheet);
+                    style::stylesheets::import_rule::ImportSheet::Sheet(sheet.clone());
                 drop(guard);
                 self.stylist
                     .force_stylesheet_origins_dirty(style::stylesheets::OriginSet::all());
+                // Fetch the fonts the imported sheet names, now that the rule
+                // owns it (<https://drafts.csswg.org/css-fonts-4/#font-face-rule-processing>).
+                self.load_sheet_font_faces(&DocumentStyleSheet(sheet), None);
             }
             Resource::Image(_kind, width, height, image_data) => {
                 // Create the ImageData and cache it
@@ -2170,7 +2311,10 @@ impl BaseDocument {
                 let Some(key) = res.image_key.clone() else {
                     return;
                 };
-                let final_url = res.resolved_url.as_deref().and_then(|url| Url::parse(url).ok());
+                let final_url = res
+                    .resolved_url
+                    .as_deref()
+                    .and_then(|url| Url::parse(url).ok());
                 self.apply_loaded_image(&key, image, final_url, res.origin_clean);
             }
             #[cfg(feature = "svg")]
@@ -2181,7 +2325,10 @@ impl BaseDocument {
                 let Some(key) = res.image_key.clone() else {
                     return;
                 };
-                let final_url = res.resolved_url.as_deref().and_then(|url| Url::parse(url).ok());
+                let final_url = res
+                    .resolved_url
+                    .as_deref()
+                    .and_then(|url| Url::parse(url).ok());
                 self.apply_loaded_image(&key, image, final_url, res.origin_clean);
             }
             Resource::DocumentSrc(html) => {
@@ -2209,9 +2356,10 @@ impl BaseDocument {
 
                 // TODO: Investigate eliminating double-box
                 let mut global_font_ctx = self.font_ctx.lock().unwrap();
-                global_font_ctx
+                let families = global_font_ctx
                     .collection
-                    .register_fonts(font.clone(), Some(info_override));
+                    .register_fonts(font.clone(), Some(info_override))
+                    .len();
 
                 #[cfg(feature = "parallel-construct")]
                 {
@@ -2226,6 +2374,32 @@ impl BaseDocument {
                     });
                 }
                 drop(global_font_ctx);
+
+                if families == 0 {
+                    // A source whose bytes register no face is a failed
+                    // source: the rule moves to its next source, and settles
+                    // as an error when the list runs out
+                    // (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+                    if let Some(key) = res.font_face {
+                        self.load_font_face_sources(
+                            crate::net::FontFaceLoadKey {
+                                source_index: key.source_index + 1,
+                                ..key
+                            },
+                            res.node_id,
+                        );
+                    }
+                    return;
+                }
+                if let Some(key) = res.font_face {
+                    self.pending_font_face_events.push(
+                        crate::font_face_events::PendingFontFaceEvent {
+                            rule: key.rule.clone(),
+                            status: crate::font_face_events::FontFaceLoadStatus::Loaded,
+                            url: res.resolved_url,
+                        },
+                    );
+                }
 
                 // TODO: see if we can only invalidate if resolved fonts may have changed
                 self.invalidate_inline_contexts();
@@ -2604,8 +2778,7 @@ impl BaseDocument {
         if x < 0.0 || y < 0.0 || x > viewport_width || y > viewport_height {
             return Vec::new();
         }
-        if self.root_node().first_element_child().is_none()
-        {
+        if self.root_node().first_element_child().is_none() {
             return Vec::new();
         }
 
@@ -3134,7 +3307,8 @@ impl BaseDocument {
             .and_then(|el| el.sub_doc_data_mut())
     }
 
-    pub fn is_animating(&self) -> bool {        #[cfg(feature = "custom-widget")]
+    pub fn is_animating(&self) -> bool {
+        #[cfg(feature = "custom-widget")]
         let custom_widget_is_animating = self.custom_widget_nodes.iter().any(|&node_id| {
             self.nodes[node_id]
                 .element_data()
@@ -4749,6 +4923,7 @@ mod stale_resource_response_tests {
             resolved_url: None,
             image_key: None,
             origin_clean: false,
+            font_face: None,
             result: Ok(Resource::Css(sheet)),
         });
 
@@ -4860,6 +5035,7 @@ mod font_face_override_tests {
             resolved_url: Some(String::from("test://aliased-family")),
             image_key: None,
             origin_clean: false,
+            font_face: None,
             result: Ok(Resource::Font(
                 blitz_traits::net::Bytes::from_static(crate::BULLET_FONT),
                 FontFaceOverrides {
@@ -4892,6 +5068,116 @@ mod font_face_override_tests {
 }
 
 #[cfg(test)]
+mod font_face_source_loop_tests {
+    use super::*;
+    use crate::font_face_events::FontFaceLoadStatus;
+    use crate::net::FontFaceLoadKey;
+
+    /// The source walk is driven with the document's own sheet parsing: a
+    /// rule's `Arc` is read back out of a made stylesheet, so the walk sees
+    /// exactly what a live document's sheet holds.
+    fn font_face_rule(document: &BaseDocument, css: &str) -> ServoArc<Locked<FontFaceRule>> {
+        let sheet = document.make_stylesheet(css, Origin::Author);
+        let guard = document.guard.read();
+        sheet
+            .contents(&guard)
+            .rules(&guard)
+            .iter()
+            .find_map(|rule| match rule {
+                CssRule::FontFace(rule) => Some(rule.clone()),
+                _ => None,
+            })
+            .expect("the sheet must hold a @font-face rule")
+    }
+
+    /// Registers the bullet font under `alias` through the load path, so
+    /// `local(alias)` has a family the collection answers for.
+    fn register_bullet_font(document: &mut BaseDocument, alias: &str) {
+        document.load_resource(ResourceLoadResponse {
+            request_id: 0,
+            node_id: None,
+            resolved_url: None,
+            image_key: None,
+            origin_clean: false,
+            font_face: None,
+            result: Ok(Resource::Font(
+                blitz_traits::net::Bytes::from_static(crate::BULLET_FONT),
+                crate::net::FontFaceOverrides {
+                    family_name: Some(String::from(alias)),
+                    weight: None,
+                    style: None,
+                    width: None,
+                },
+            )),
+        });
+    }
+
+    /// A `local()` entry is a failed source the walk falls through (see
+    /// [`crate::net::FontFaceSourceEntry`]) even when the family is held, so
+    /// a rule whose remaining entries cannot name a font settles as an error
+    /// (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+    #[test]
+    fn a_local_family_falls_through_to_the_next_source() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        register_bullet_font(&mut document, "HeldFace");
+        let rule = font_face_rule(
+            &document,
+            "@font-face { font-family: X; src: local(HeldFace), url(dead.svg) }",
+        );
+        document.load_font_face_sources(
+            FontFaceLoadKey {
+                rule: rule.clone(),
+                sheet_url: None,
+                source_index: 0,
+            },
+            None,
+        );
+        let events = document.take_pending_font_face_events();
+        assert_eq!(events.len(), 1, "the skipped sources settle the rule once");
+        assert_eq!(events[0].status, FontFaceLoadStatus::Error);
+        assert!(ServoArc::ptr_eq(&events[0].rule, &rule));
+    }
+
+    /// Bytes that register no face are a failed source: the load moves the
+    /// rule's list past them, and a list with nothing usable left settles as
+    /// an error (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+    #[test]
+    fn a_face_that_registers_nothing_advances_the_list() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let rule = font_face_rule(
+            &document,
+            "@font-face { font-family: X; src: url(dead.ttf), local(HeldFace), url(dead2.svg) }",
+        );
+        document.load_resource(ResourceLoadResponse {
+            request_id: 0,
+            node_id: None,
+            resolved_url: Some(String::from("test://dead")),
+            image_key: None,
+            origin_clean: false,
+            font_face: Some(FontFaceLoadKey {
+                rule: rule.clone(),
+                sheet_url: None,
+                source_index: 0,
+            }),
+            // Bytes that parse as no font face: the source failed.
+            result: Ok(Resource::Font(
+                blitz_traits::net::Bytes::from_static(b"not a font at all"),
+                crate::net::FontFaceOverrides {
+                    family_name: Some(String::from("X")),
+                    weight: None,
+                    style: None,
+                    width: None,
+                },
+            )),
+        });
+        let events = document.take_pending_font_face_events();
+        assert_eq!(events.len(), 1, "the advance settles the rule once");
+        assert_eq!(events[0].status, FontFaceLoadStatus::Error);
+        assert!(ServoArc::ptr_eq(&events[0].rule, &rule));
+    }
+}
+
+#[cfg(test)]
 mod change_tracking_tests {
     use super::*;
     use crate::qual_name;
@@ -4913,10 +5199,7 @@ mod change_tracking_tests {
         mutator.append_children(root_id, &[html]);
         drop(mutator);
         doc.resolve(0.0);
-        assert!(
-            !doc.has_changes(),
-            "a resolve consumes the pending changes"
-        );
+        assert!(!doc.has_changes(), "a resolve consumes the pending changes");
 
         doc.mutate()
             .set_attribute(button, qual_name!("aria-label"), "Submit");

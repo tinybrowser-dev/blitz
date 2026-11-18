@@ -467,6 +467,57 @@ impl BaseDocument {
         self.cssom_rule_count(self.node_cssom_sheet.get(&node_id).copied()?, path)
     }
 
+    /// The CSSOM address of one `@font-face` rule: the sheet id and the rule
+    /// path that names it in `document.styleSheets`, or `None` when no live
+    /// registered sheet holds it. An embedder uses the address to tell page
+    /// script which rule's font face settled
+    /// (<https://drafts.csswg.org/css-font-loading/#dom-fontface-status>).
+    pub fn cssom_font_face_rule_path(
+        &self,
+        font_face: &ServoArc<Locked<FontFaceRule>>,
+    ) -> Option<(u64, Vec<usize>)> {
+        let guard = self.guard.read();
+        for (sheet_id, record) in self.cssom_sheets.iter() {
+            if !record.live {
+                continue;
+            }
+            let rules = record.sheet.contents(&guard).rules.clone();
+            let mut path = Vec::new();
+            if let Some(found) = Self::find_font_face_rule(&rules, font_face, &guard, &mut path) {
+                return Some((*sheet_id, found));
+            }
+        }
+        None
+    }
+
+    /// Depth-first search for `font_face` under `rules`, extending `path`
+    /// with each descended rule's index. Answers the completed path.
+    fn find_font_face_rule(
+        rules: &ServoArc<Locked<CssRules>>,
+        font_face: &ServoArc<Locked<FontFaceRule>>,
+        guard: &SharedRwLockReadGuard,
+        path: &mut Vec<usize>,
+    ) -> Option<Vec<usize>> {
+        for (index, rule) in rules.read_with(guard).0.iter().enumerate() {
+            if let CssRule::FontFace(found) = rule {
+                if ServoArc::ptr_eq(found, font_face) {
+                    path.push(index);
+                    return Some(path.clone());
+                }
+                continue;
+            }
+            let Some(RuleList::Css(children)) = child_rule_list(rule, guard) else {
+                continue;
+            };
+            path.push(index);
+            if Self::find_font_face_rule(&children, font_face, guard, path).is_some() {
+                return Some(path.clone());
+            }
+            path.pop();
+        }
+        None
+    }
+
     /// [`Self::stylesheet_rule_count`] for a CSSOM sheet id, including a sheet
     /// that has left the document.
     pub fn cssom_rule_count(&self, sheet_id: u64, path: &[usize]) -> Option<usize> {
@@ -924,25 +975,19 @@ impl BaseDocument {
         };
 
         let guard = lock.read();
-        if live {
-            if let CssRule::FontFace(_) = &new_rule {
-                // The owning sheet's location is not reachable from a rule
-                // list here, so the document's own referrer and policy apply
-                // to a font this CSSOM insertion introduces. `insertRule` on a
-                // linked sheet is the uncovered case.
-                crate::net::fetch_font_face_rules(
-                    std::iter::once(&new_rule),
-                    None,
-                    self.tx.clone(),
-                    self.id(),
-                    owner,
-                    &self.net_provider,
-                    &self.shell_provider,
-                    &guard,
-                    self.abort_signal.as_ref(),
-                );
+        // The owning sheet's location is not reachable from a rule list here,
+        // so the document's own referrer and policy apply to a font this
+        // CSSOM insertion introduces. `insertRule` on a linked sheet is the
+        // uncovered case. The load starts after the guard: its source walk
+        // takes its own read.
+        let inserted_font_face = if live {
+            match &new_rule {
+                CssRule::FontFace(rule) => Some(rule.clone()),
+                _ => None,
             }
-        }
+        } else {
+            None
+        };
         let (change_kind, ancestors) = match &list {
             RuleList::Css(_) => (RuleChangeKind::Insertion, ancestors.as_slice()),
             // The keyframes rule itself changed; its ancestors exclude it
@@ -955,6 +1000,10 @@ impl BaseDocument {
             let ancestor_refs: Vec<CssRuleRef> = ancestors.iter().map(CssRuleRef::from).collect();
             self.stylist
                 .rule_changed(&sheet, &new_rule, &guard, change_kind, &ancestor_refs);
+        }
+        drop(guard);
+        if let Some(rule) = inserted_font_face {
+            self.load_font_face_rule(&rule, None, owner);
         }
         Ok(index)
     }

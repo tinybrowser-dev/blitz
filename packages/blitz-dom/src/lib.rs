@@ -47,6 +47,8 @@ mod config;
 mod cssom;
 mod debug;
 mod events;
+/// The `@font-face` load outcomes an embedder drains.
+pub mod font_face_events;
 mod font_metrics;
 /// Form owners, entry lists, and submission planning.
 pub mod form;

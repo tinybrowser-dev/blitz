@@ -7,14 +7,14 @@ use std::{
 };
 use style::{
     font_face::{
-        FontFaceSourceFormat, FontFaceSourceFormatKeyword, FontStyleRange, Source, SourceList,
+        FontFaceRule, FontFaceSourceFormat, FontFaceSourceFormatKeyword, FontStyleRange, Source,
     },
     media_queries::MediaList,
     servo_arc::Arc as ServoArc,
     shared_lock::SharedRwLock,
     shared_lock::{Locked, SharedRwLockReadGuard},
     stylesheets::{
-        CssRule, DocumentStyleSheet, ImportRule, Origin, Stylesheet, StylesheetInDocument,
+        DocumentStyleSheet, ImportRule, Origin, Stylesheet,
         StylesheetLoader as ServoStylesheetLoader, UrlExtraData,
         import_rule::{ImportLayer, ImportSheet, ImportSupportsCondition},
     },
@@ -124,12 +124,16 @@ impl<T: Send + Sync + 'static> ResourceHandler<T> {
     /// element's CORS state
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
     /// `origin_clean` is the response taint an image request settles with;
-    /// other resources carry `false` and ignore it.
+    /// other resources carry `false` and ignore it. `font_face` names the
+    /// `@font-face` rule and source a font response settled, so the document
+    /// can advance the rule's source list on failure
+    /// (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
     fn respond(
         &self,
         resolved_url: Option<String>,
         image_key: Option<crate::document::ImageKey>,
         origin_clean: bool,
+        font_face: Option<crate::net::FontFaceLoadKey>,
         result: Result<Resource, String>,
     ) {
         let response = ResourceLoadResponse {
@@ -138,6 +142,7 @@ impl<T: Send + Sync + 'static> ResourceHandler<T> {
             resolved_url,
             image_key,
             origin_clean,
+            font_face,
             result,
         };
         let _ = self.tx.send(DocumentEvent::ResourceLoad(response));
@@ -156,6 +161,8 @@ pub struct ResourceLoadResponse {
     /// with it carries the taint into canvas
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
     pub origin_clean: bool,
+    /// The `@font-face` rule and source index a font response belongs to.
+    pub font_face: Option<crate::net::FontFaceLoadKey>,
     pub result: Result<Resource, String>,
 }
 
@@ -168,7 +175,7 @@ pub struct StylesheetHandler {
 
 impl NetHandler for ResourceHandler<StylesheetHandler> {
     fn error(self: Box<Self>, url: String, error: String) {
-        self.respond(Some(url), None, false, Err(error));
+        self.respond(Some(url), None, false, None, Err(error));
     }
 
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
@@ -200,6 +207,7 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
             Some(resolved_url),
             None,
             false,
+            None,
             Ok(Resource::Css(DocumentStyleSheet(ServoArc::new(sheet)))),
         );
     }
@@ -281,7 +289,6 @@ impl ServoStylesheetLoader for StylesheetLoader {
                     lock: lock.clone(),
                     media,
                     import_rule: import.clone(),
-                    net_provider: self.net_provider.clone(),
                 },
             ),
         );
@@ -296,7 +303,6 @@ struct NestedStylesheetHandler {
     url: ServoArc<Url>,
     media: ServoArc<Locked<MediaList>>,
     import_rule: ServoArc<Locked<ImportRule>>,
-    net_provider: Arc<dyn NetProvider>,
 }
 
 impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
@@ -324,36 +330,60 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
             QuirksMode::NoQuirks,
         ));
 
-        // Fetch @font-face fonts
-        fetch_font_face(
-            self.tx.clone(),
-            self.doc_id,
-            self.node_id,
-            &sheet,
-            &self.data.net_provider,
-            &self.shell_provider,
-            &self.data.lock.read(),
-            self.data.loader.abort_signal.as_ref(),
-        );
+        // The fonts the sheet names are fetched when the document installs
+        // it, so the rule's source list is owned where the load outcomes are
+        // processed (<https://drafts.csswg.org/css-fonts-4/#font-face-rule-processing>).
 
         let import_rule = self.data.import_rule.clone();
         self.respond(
             Some(resolved_url),
             None,
             false,
+            None,
             Ok(Resource::ImportedCss(import_rule, sheet)),
         )
     }
 }
 
+/// One in-flight `@font-face` fetch: the rule the source list came from, the
+/// index of the source being fetched, and the parse hints that source gave.
+/// The document thread uses the rule to advance the source list when this
+/// source fails
+/// (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+#[derive(Clone)]
+pub struct FontFaceLoadKey {
+    pub rule: ServoArc<Locked<FontFaceRule>>,
+    /// The URL the fetch's sheet came from, so the next source's request
+    /// carries the same referrer the first one did
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+    pub sheet_url: Option<Url>,
+    pub source_index: usize,
+}
+
 struct FontFaceHandler {
+    key: FontFaceLoadKey,
     format: FontFaceSourceFormatKeyword,
     overrides: FontFaceOverrides,
 }
 impl NetHandler for ResourceHandler<FontFaceHandler> {
     fn bytes(mut self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let result = self.data.parse(bytes);
-        self.respond(Some(resolved_url), None, false, result)
+        self.respond(
+            Some(resolved_url),
+            None,
+            false,
+            Some(self.data.key.clone()),
+            result,
+        )
+    }
+    fn error(self: Box<Self>, url: String, error: String) {
+        self.respond(
+            Some(url),
+            None,
+            false,
+            Some(self.data.key.clone()),
+            Err(error),
+        )
     }
 }
 impl FontFaceHandler {
@@ -392,13 +422,15 @@ impl FontFaceHandler {
                 tracing::info!("Decompressing woff1 font");
 
                 // Use wuff crate to decompress font
-                let decompressed = wuff::decompress_woff1(&bytes).ok();
-
-                if let Some(decompressed) = decompressed {
-                    bytes = Bytes::from(decompressed);
-                } else {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!("Failed to decompress woff1 font");
+                match wuff::decompress_woff1(&bytes) {
+                    Ok(decompressed) => bytes = Bytes::from(decompressed),
+                    Err(error) => {
+                        // A compressed source whose bytes do not decompress
+                        // is a failed source, not a font that keeps its
+                        // compressed bytes as data
+                        // (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+                        return Err(format!("woff1 decompression failed: {error}"));
+                    }
                 }
             }
             #[cfg(feature = "woff")]
@@ -407,18 +439,18 @@ impl FontFaceHandler {
                 tracing::info!("Decompressing woff2 font");
 
                 // Use wuff crate to decompress font
-                let decompressed = wuff::decompress_woff2(&bytes).ok();
-
-                if let Some(decompressed) = decompressed {
-                    bytes = Bytes::from(decompressed);
-                } else {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!("Failed to decompress woff2 font");
+                match wuff::decompress_woff2(&bytes) {
+                    Ok(decompressed) => bytes = Bytes::from(decompressed),
+                    Err(error) => {
+                        return Err(format!("woff2 decompression failed: {error}"));
+                    }
                 }
             }
             FontFaceSourceFormatKeyword::None => {
-                // Should this be an error?
-                return Ok(Resource::None);
+                // Bytes that carry no known font magic register no face, so
+                // the source failed and the list moves on
+                // (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+                return Err("no supported font signature found".to_string());
             }
             _ => {}
         }
@@ -427,136 +459,121 @@ impl FontFaceHandler {
     }
 }
 
-/// Fetch the fonts of all `@font-face` rules in `sheet`
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fetch_font_face(
-    tx: Sender<DocumentEvent>,
-    doc_id: usize,
-    node_id: Option<NodeId>,
-    sheet: &Stylesheet,
-    network_provider: &Arc<dyn NetProvider>,
-    shell_provider: &Arc<dyn ShellProvider>,
-    read_guard: &SharedRwLockReadGuard,
-    abort_signal: Option<&AbortSignal>,
-) {
-    fetch_font_face_rules(
-        sheet.contents(read_guard).rules(read_guard).iter(),
-        // The sheet's location is the referrer for every font it names, and
-        // its response carried the policy the embedder applies
-        // (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-        Some(sheet.contents(read_guard).url_data.0.as_ref().clone()),
-        tx,
-        doc_id,
-        node_id,
-        network_provider,
-        shell_provider,
-        read_guard,
-        abort_signal,
-    )
+/// One `@font-face` source at an index in the rule's list that can start a
+/// fetch. A `local()` family is not here: fontique offers no way to make a
+/// family the collection already holds become the source of another family
+/// name, so a `local()` entry is a failed source and the walk falls through
+/// to the next entry (the gap is recorded in the embedder's
+/// `docs/upstream.md`; <https://drafts.csswg.org/css-fonts-4/#src-desc>).
+pub(crate) enum FontFaceSourceEntry {
+    Url(Url, FontFaceSourceFormatKeyword),
 }
 
-/// Fetch the fonts of the `@font-face` rules among `rules`
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fetch_font_face_rules<'a>(
-    rules: impl Iterator<Item = &'a CssRule>,
-    style_sheet: Option<Url>,
-    tx: Sender<DocumentEvent>,
-    doc_id: usize,
-    node_id: Option<NodeId>,
-    network_provider: &Arc<dyn NetProvider>,
-    shell_provider: &Arc<dyn ShellProvider>,
-    read_guard: &SharedRwLockReadGuard,
-    abort_signal: Option<&AbortSignal>,
-) {
-    rules
-        .filter_map(|rule| match rule {
-            CssRule::FontFace(font_face) => {
-                let descriptor = &font_face.read_with(read_guard).descriptors;
-                let family = descriptor.font_family.as_ref()?;
-                let src = descriptor.src.as_ref()?;
-                // Capture the @font-face descriptors so parley can register
-                // the font under the CSS-declared family name (and weight /
-                // style) rather than whatever metadata the TTF reports.
-                let overrides = FontFaceOverrides {
-                    family_name: Some(family.name.to_string()),
-                    weight: descriptor
-                        .font_weight
-                        .as_ref()
-                        .and_then(|range| range.0.compute().map(|w| w.value())),
-                    style: descriptor.font_style.as_ref().map(stylo_to_fontique_style),
-                    width: descriptor.font_width.as_ref().and_then(|range| {
-                        range
-                            .compute()
-                            .map(|w| parley::fontique::FontWidth::from_percentage(w.0.0.to_float()))
-                    }),
-                };
-                Some((src, overrides))
-            }
-            _ => None,
-        })
-        .for_each(|(source_list, overrides)| {
-            if let Some((url, format)) = preferred_font_source(source_list) {
-                network_provider.fetch(
-                    doc_id,
-                    stamped_request(url, abort_signal)
-                        .kind(RequestKind::Font)
-                        .style_sheet(style_sheet.clone()),
-                    ResourceHandler::boxed(
-                        tx.clone(),
-                        doc_id,
-                        node_id,
-                        shell_provider.clone(),
-                        FontFaceHandler { format, overrides },
-                    ),
-                );
-            }
-        })
-}
+/// Reads `rule`'s `src` list at `index`, or `None` when that entry cannot
+/// name a font: an unsupported format, an unresolvable url, or no entry at
+/// that index. The document thread skips `None` entries and moves the index
+/// forward (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+pub(crate) fn font_face_source(
+    rule: &ServoArc<Locked<FontFaceRule>>,
+    guard: &SharedRwLockReadGuard,
+    index: usize,
+) -> Option<FontFaceSourceEntry> {
+    let descriptor = &rule.read_with(guard).descriptors;
+    let source = descriptor.src.as_ref()?.0.get(index)?;
+    let url_source = match source {
+        Source::Local(_) => return None,
+        Source::Url(url_source) => url_source,
+    };
+    // A relative url with no base url to resolve against
+    // yields None; skip the source instead of panicking
+    let url = url_source.url.url()?;
 
-/// The first source in an `@font-face` `src` list that is in a format we
-/// support, with its resolved url and format.
-fn preferred_font_source(source_list: &SourceList) -> Option<(Url, FontFaceSourceFormatKeyword)> {
-    source_list.0.iter().find_map(|source| {
-        let url_source = match source {
-            Source::Url(url_source) => url_source,
-            // TODO: support local fonts in @font-face
-            Source::Local(_) => return None,
-        };
+    let format = match &url_source.format_hint {
+        Some(FontFaceSourceFormat::Keyword(keyword)) => *keyword,
+        Some(FontFaceSourceFormat::String(string)) => font_format_from_string(string),
+        None => font_format_from_extension(url),
+    };
 
-        // A relative url with no base url to resolve against
-        // yields None; skip the source instead of panicking
-        let Some(url) = url_source.url.url() else {
-            #[cfg(feature = "tracing")]
-            tracing::warn!("Skipping @font-face source with unresolvable url");
-            return None;
-        };
-
-        let format = match &url_source.format_hint {
-            Some(FontFaceSourceFormat::Keyword(keyword)) => *keyword,
-            Some(FontFaceSourceFormat::String(string)) => font_format_from_string(string),
-            None => font_format_from_extension(url),
-        };
-
-        let supported = match format {
-            FontFaceSourceFormatKeyword::None
-            | FontFaceSourceFormatKeyword::Collection
-            | FontFaceSourceFormatKeyword::Opentype
-            | FontFaceSourceFormatKeyword::Truetype => true,
-            FontFaceSourceFormatKeyword::Woff | FontFaceSourceFormatKeyword::Woff2 => {
-                cfg!(feature = "woff")
-            }
-            FontFaceSourceFormatKeyword::EmbeddedOpentype
-            | FontFaceSourceFormatKeyword::Svg
-            | FontFaceSourceFormatKeyword::Unknown => false,
-        };
-        if !supported {
-            #[cfg(feature = "tracing")]
-            tracing::warn!("Skipping unsupported font of type {:?}", format);
-            return None;
+    let supported = match format {
+        FontFaceSourceFormatKeyword::None
+        | FontFaceSourceFormatKeyword::Collection
+        | FontFaceSourceFormatKeyword::Opentype
+        | FontFaceSourceFormatKeyword::Truetype => true,
+        FontFaceSourceFormatKeyword::Woff | FontFaceSourceFormatKeyword::Woff2 => {
+            cfg!(feature = "woff")
         }
+        FontFaceSourceFormatKeyword::EmbeddedOpentype
+        | FontFaceSourceFormatKeyword::Svg
+        | FontFaceSourceFormatKeyword::Unknown => false,
+    };
+    if !supported {
+        #[cfg(feature = "tracing")]
+        tracing::warn!("Skipping unsupported font of type {:?}", format);
+        return None;
+    }
 
-        Some((url.as_ref().clone(), format))
+    Some(FontFaceSourceEntry::Url(url.as_ref().clone(), format))
+}
+
+/// The `@font-face` descriptors parley registers the rule's bytes under.
+/// `None` when the rule declares no family to alias the bytes as.
+pub(crate) fn font_face_overrides(
+    rule: &ServoArc<Locked<FontFaceRule>>,
+    guard: &SharedRwLockReadGuard,
+) -> Option<FontFaceOverrides> {
+    let descriptor = &rule.read_with(guard).descriptors;
+    let family = descriptor.font_family.as_ref()?;
+    // Capture the @font-face descriptors so parley can register
+    // the font under the CSS-declared family name (and weight /
+    // style) rather than whatever metadata the TTF reports.
+    Some(FontFaceOverrides {
+        family_name: Some(family.name.to_string()),
+        weight: descriptor
+            .font_weight
+            .as_ref()
+            .and_then(|range| range.0.compute().map(|w| w.value())),
+        style: descriptor.font_style.as_ref().map(stylo_to_fontique_style),
+        width: descriptor.font_width.as_ref().and_then(|range| {
+            range
+                .compute()
+                .map(|w| parley::fontique::FontWidth::from_percentage(w.0.0.to_float()))
+        }),
     })
+}
+
+/// Starts the fetch of one `@font-face` source. The response names `key`, so
+/// the document thread can advance the rule's source list when it fails
+/// (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fetch_font_face_source(
+    key: FontFaceLoadKey,
+    url: Url,
+    format: FontFaceSourceFormatKeyword,
+    overrides: FontFaceOverrides,
+    tx: Sender<DocumentEvent>,
+    doc_id: usize,
+    node_id: Option<NodeId>,
+    network_provider: &Arc<dyn NetProvider>,
+    shell_provider: &Arc<dyn ShellProvider>,
+    abort_signal: Option<&AbortSignal>,
+) {
+    network_provider.fetch(
+        doc_id,
+        stamped_request(url, abort_signal)
+            .kind(RequestKind::Font)
+            .style_sheet(key.sheet_url.clone()),
+        ResourceHandler::boxed(
+            tx,
+            doc_id,
+            node_id,
+            shell_provider.clone(),
+            FontFaceHandler {
+                key,
+                format,
+                overrides,
+            },
+        ),
+    );
 }
 
 /// Map a `format("...")` string hint to a format. Besides the keywords, this
@@ -642,7 +659,13 @@ pub(crate) struct DocumentSrcHandler;
 impl NetHandler for ResourceHandler<DocumentSrcHandler> {
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let html = String::from_utf8_lossy(&bytes).into_owned();
-        self.respond(Some(resolved_url), None, false, Ok(Resource::DocumentSrc(html)));
+        self.respond(
+            Some(resolved_url),
+            None,
+            false,
+            None,
+            Ok(Resource::DocumentSrc(html)),
+        );
     }
 }
 
@@ -686,6 +709,7 @@ impl NetHandler for ResourceHandler<ImageHandler> {
             Some(resolved_url),
             Some(self.data.key.clone()),
             info.origin_clean,
+            None,
             result,
         );
     }
@@ -734,15 +758,17 @@ impl ImageHandler {
 mod tests {
     use super::*;
     use parley::fontique::FontStyle as Fq;
-    use style::stylesheets::AllowImportRules;
+    use style::stylesheets::{AllowImportRules, CssRule, StylesheetInDocument};
     use style::values::specified::Angle;
 
     fn oblique(min_deg: f32, max_deg: f32) -> FontStyleRange {
         FontStyleRange::Oblique(Angle::from_degrees(min_deg), Angle::from_degrees(max_deg))
     }
 
-    /// The source picked from the `src` list of each `@font-face` rule in `css`
-    fn preferred_sources(css: &str) -> Vec<Option<(String, FontFaceSourceFormatKeyword)>> {
+    /// The source the walk resolves at `index` for each `@font-face` rule in
+    /// `css`, spelled for assertion: a url as its url and format, a
+    /// `local()` family as `local(name)`, and an unusable source as `None`.
+    fn sources_at(css: &str, index: usize) -> Vec<Option<(String, FontFaceSourceFormatKeyword)>> {
         let lock = SharedRwLock::new();
         let base_url = Url::parse("https://example.com/css/style.css").unwrap();
         let sheet = Stylesheet::from_str(
@@ -762,38 +788,56 @@ mod tests {
             .rules(&guard)
             .iter()
             .filter_map(|rule| match rule {
-                CssRule::FontFace(font_face) => font_face.read_with(&guard).descriptors.src.clone(),
+                CssRule::FontFace(font_face) => Some(font_face.clone()),
                 _ => None,
             })
-            .map(|src| preferred_font_source(&src).map(|(url, format)| (url.to_string(), format)))
+            .map(|rule| match font_face_source(&rule, &guard, index) {
+                Some(FontFaceSourceEntry::Url(url, format)) => Some((url.to_string(), format)),
+                None => None,
+            })
             .collect()
     }
 
+    const GLYPHICONS: &str = "@font-face {
+        font-family: 'Glyphicons Halflings';
+        src: url('../fonts/glyphicons-halflings-regular.eot');
+        src: url('../fonts/glyphicons-halflings-regular.eot?#iefix') format('embedded-opentype'),
+            url('../fonts/glyphicons-halflings-regular.woff2') format('woff2'),
+            url('../fonts/glyphicons-halflings-regular.woff') format('woff'),
+            url('../fonts/glyphicons-halflings-regular.ttf') format('truetype'),
+            url('../fonts/glyphicons-halflings-regular.svg#glyphicons_halflingsregular') format('svg');
+    }";
+
     #[test]
     fn bootstrap_glyphicons_skip_eot_source() {
-        let sources = preferred_sources(
-            "@font-face {
-                font-family: 'Glyphicons Halflings';
-                src: url('../fonts/glyphicons-halflings-regular.eot');
-                src: url('../fonts/glyphicons-halflings-regular.eot?#iefix') format('embedded-opentype'),
-                    url('../fonts/glyphicons-halflings-regular.woff2') format('woff2'),
-                    url('../fonts/glyphicons-halflings-regular.woff') format('woff'),
-                    url('../fonts/glyphicons-halflings-regular.ttf') format('truetype'),
-                    url('../fonts/glyphicons-halflings-regular.svg#glyphicons_halflingsregular') format('svg');
-            }",
+        // The second `src` declaration wins; its first entry names an
+        // embedded-opentype url, which cannot start a fetch. The walk moves
+        // to the first source that can
+        // (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+        assert_eq!(
+            sources_at(GLYPHICONS, 0),
+            [None],
+            "the eot?#iefix source is unsupported"
         );
-        let expected = if cfg!(feature = "woff") {
-            (
-                "https://example.com/fonts/glyphicons-halflings-regular.woff2",
-                FontFaceSourceFormatKeyword::Woff2,
-            )
+        if cfg!(feature = "woff") {
+            assert_eq!(
+                sources_at(GLYPHICONS, 1),
+                [Some((
+                    "https://example.com/fonts/glyphicons-halflings-regular.woff2".to_string(),
+                    FontFaceSourceFormatKeyword::Woff2,
+                ))]
+            );
         } else {
-            (
-                "https://example.com/fonts/glyphicons-halflings-regular.ttf",
-                FontFaceSourceFormatKeyword::Truetype,
-            )
-        };
-        assert_eq!(sources, [Some((expected.0.to_string(), expected.1))]);
+            assert_eq!(sources_at(GLYPHICONS, 1), [None], "woff2 needs the feature");
+            assert_eq!(sources_at(GLYPHICONS, 2), [None], "woff needs the feature");
+            assert_eq!(
+                sources_at(GLYPHICONS, 3),
+                [Some((
+                    "https://example.com/fonts/glyphicons-halflings-regular.ttf".to_string(),
+                    FontFaceSourceFormatKeyword::Truetype,
+                ))]
+            );
+        }
     }
 
     #[test]
@@ -841,23 +885,54 @@ mod tests {
     #[test]
     fn unsupported_sources_are_skipped() {
         use FontFaceSourceFormatKeyword as Kw;
-        let sources = preferred_sources(
-            "@font-face { font-family: a; src: url(a.ttf) format('x-unknown'), url(a.otf); }
+        let css = "@font-face { font-family: a; src: url(a.ttf) format('x-unknown'), url(a.otf); }
             @font-face { font-family: b; src: url(b.svg#b), url(b.eot), url(b.ttf?v=1#x); }
             @font-face { font-family: c; src: url(c.eot) format(embedded-opentype); }
-            @font-face { font-family: d; src: url(d.eot) format(truetype); }",
+            @font-face { font-family: d; src: url(d.eot) format(truetype); }";
+        assert_eq!(
+            sources_at(css, 0),
+            [
+                None,
+                None,
+                None,
+                Some(("https://example.com/css/d.eot".to_string(), Kw::Truetype)),
+            ],
+            "only rule d's first source can start a fetch"
         );
         assert_eq!(
-            sources,
+            sources_at(css, 1),
             [
                 Some(("https://example.com/css/a.otf".to_string(), Kw::Opentype)),
+                None,
+                None,
+                None,
+            ],
+        );
+        assert_eq!(
+            sources_at(css, 2),
+            [
+                None,
                 Some((
                     "https://example.com/css/b.ttf?v=1#x".to_string(),
                     Kw::Truetype
                 )),
                 None,
-                Some(("https://example.com/css/d.eot".to_string(), Kw::Truetype)),
-            ]
+                None,
+            ],
+        );
+    }
+
+    #[test]
+    fn a_local_source_is_a_failed_source() {
+        // fontique cannot make a family the collection already holds become
+        // the source of another family name, so a local() entry cannot start
+        // a fetch (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
+        assert_eq!(
+            sources_at(
+                "@font-face { font-family: x; src: url(a.ttf), local(My Face), url(b.ttf) }",
+                1
+            ),
+            [None],
         );
     }
 
