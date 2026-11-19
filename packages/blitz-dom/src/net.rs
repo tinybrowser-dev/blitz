@@ -348,16 +348,22 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
 /// One in-flight `@font-face` fetch: the rule the source list came from, the
 /// index of the source being fetched, and the parse hints that source gave.
 /// The document thread uses the rule to advance the source list when this
-/// source fails
+/// source fails, and the CSSOM address to report the outcome where script can
+/// find the rule
 /// (<https://drafts.csswg.org/css-fonts-4/#src-desc>).
 #[derive(Clone)]
 pub struct FontFaceLoadKey {
     pub rule: ServoArc<Locked<FontFaceRule>>,
-    /// The URL the fetch's sheet came from, so the next source's request
-    /// carries the same referrer the first one did
+    /// The URL the fetch was made from, so the next source's request carries
+    /// the same referrer the first one did
     /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
     pub sheet_url: Option<Url>,
     pub source_index: usize,
+    /// The rule's CSSOM address, recorded when the walk started: a
+    /// re-processed style element replaces its sheet, so resolving the
+    /// address at delivery would name a rule that is no longer there.
+    pub cssom_sheet: u64,
+    pub cssom_path: Vec<usize>,
 }
 
 struct FontFaceHandler {

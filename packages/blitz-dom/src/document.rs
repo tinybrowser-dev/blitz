@@ -364,6 +364,10 @@ pub struct BaseDocument {
     pub(crate) cssom_sheets: HashMap<u64, crate::cssom::CssomSheetRecord>,
     /// The live CSSOM sheet id for an owner node, if it has one.
     pub(crate) node_cssom_sheet: HashMap<NodeId, u64>,
+    /// Every `@import`-loaded sheet this document registered for CSSOM, with
+    /// its id. A second walk or `CSSImportRule.styleSheet` answers the record
+    /// the first one made instead of registering a copy.
+    pub(crate) imported_cssom_sheets: Vec<(ServoArc<Stylesheet>, u64)>,
     pub(crate) next_cssom_sheet: u64,
     /// Map from form control node ID's to their associated forms node ID's
     pub(crate) controls_to_form: HashMap<NodeId, NodeId>,
@@ -765,6 +769,7 @@ impl BaseDocument {
             stylesheet_generation: 0,
             cssom_sheets: HashMap::new(),
             node_cssom_sheet: HashMap::new(),
+            imported_cssom_sheets: Vec::new(),
             next_cssom_sheet: 1,
             font_ctx,
             #[cfg(feature = "parallel-construct")]
@@ -1938,7 +1943,7 @@ impl BaseDocument {
         // Inline sheets are same-document. A fetched `<link>` sheet overwrites
         // this with the response URL's origin-clean flag before script runs
         // (<https://drafts.csswg.org/cssom/#concept-css-style-sheet-origin-clean-flag>).
-        self.retain_cssom_sheet(stylesheet.clone(), node_id, true);
+        let cssom_sheet = self.retain_cssom_sheet(stylesheet.clone(), node_id, true);
         self.has_changes = true;
         let old = self.nodes_to_stylesheet.insert(node_id, stylesheet.clone());
         self.stylesheet_generation += 1;
@@ -1947,8 +1952,9 @@ impl BaseDocument {
             self.stylist.remove_stylesheet(old, &self.guard.read())
         }
 
-        // Fetch @font-face fonts
-        self.load_sheet_font_faces(&stylesheet, Some(node_id));
+        // Fetch @font-face fonts. The CSSOM registration names the sheet, so
+        // the rules report their outcomes at the address it just got.
+        self.load_sheet_font_faces(&stylesheet, Some(node_id), cssom_sheet);
 
         // Store data on element. A processing instruction owns its sheet
         // without element storage; the owner map still records its tree
@@ -2096,7 +2102,14 @@ impl BaseDocument {
     /// The sheet's location is the referrer for every font it names, and its
     /// response carried the policy the embedder applies
     /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-    fn load_sheet_font_faces(&mut self, sheet: &DocumentStyleSheet, node_id: Option<NodeId>) {
+    /// `cssom_sheet` is the id the CSSOM registration just handed the sheet;
+    /// a rule reports its outcome at that address.
+    fn load_sheet_font_faces(
+        &mut self,
+        sheet: &DocumentStyleSheet,
+        node_id: Option<NodeId>,
+        cssom_sheet: u64,
+    ) {
         let keys: Vec<crate::net::FontFaceLoadKey> = {
             let guard = self.guard.read();
             let contents = sheet.contents(&guard);
@@ -2104,11 +2117,14 @@ impl BaseDocument {
             contents
                 .rules(&guard)
                 .iter()
-                .filter_map(|rule| match rule {
+                .enumerate()
+                .filter_map(|(index, rule)| match rule {
                     CssRule::FontFace(rule) => Some(crate::net::FontFaceLoadKey {
                         rule: rule.clone(),
                         sheet_url: sheet_url.clone(),
                         source_index: 0,
+                        cssom_sheet,
+                        cssom_path: vec![index],
                     }),
                     _ => None,
                 })
@@ -2123,17 +2139,23 @@ impl BaseDocument {
     /// sheet walk would find. The rule carries its own source list; the
     /// document's referrer and policy apply when the owning sheet is not
     /// reachable (`insertRule` on a linked sheet is the uncovered case).
+    /// `cssom_sheet` and `cssom_path` are the address the rule was inserted
+    /// at, so its outcome reports where script can find it.
     pub(crate) fn load_font_face_rule(
         &mut self,
         rule: &ServoArc<Locked<FontFaceRule>>,
         sheet_url: Option<url::Url>,
         node_id: Option<NodeId>,
+        cssom_sheet: u64,
+        cssom_path: &[usize],
     ) {
         self.load_font_face_sources(
             crate::net::FontFaceLoadKey {
                 rule: rule.clone(),
                 sheet_url,
                 source_index: 0,
+                cssom_sheet,
+                cssom_path: cssom_path.to_vec(),
             },
             node_id,
         );
@@ -2185,6 +2207,8 @@ impl BaseDocument {
                         rule: key.rule.clone(),
                         status: crate::font_face_events::FontFaceLoadStatus::Error,
                         url: None,
+                        sheet: key.cssom_sheet,
+                        path: key.cssom_path.clone(),
                     });
                 return;
             };
@@ -2210,6 +2234,8 @@ impl BaseDocument {
                 rule: key.rule.clone(),
                 status: crate::font_face_events::FontFaceLoadStatus::Error,
                 url: None,
+                sheet: key.cssom_sheet,
+                path: key.cssom_path.clone(),
             });
     }
 
@@ -2302,7 +2328,18 @@ impl BaseDocument {
                     .force_stylesheet_origins_dirty(style::stylesheets::OriginSet::all());
                 // Fetch the fonts the imported sheet names, now that the rule
                 // owns it (<https://drafts.csswg.org/css-fonts-4/#font-face-rule-processing>).
-                self.load_sheet_font_faces(&DocumentStyleSheet(sheet), None);
+                // The sheet registers for CSSOM first, so the rules report
+                // their outcomes at the address `CSSImportRule.styleSheet`
+                // later hands script. The record carries the response's
+                // origin-clean flag, the same one a directly loaded sheet
+                // gets.
+                let clean = res
+                    .resolved_url
+                    .as_deref()
+                    .is_some_and(|resolved| stylesheet_response_origin_clean(&self.url, resolved));
+                let imported = DocumentStyleSheet(sheet);
+                let cssom_sheet = self.register_imported_cssom_sheet(&imported, clean);
+                self.load_sheet_font_faces(&imported, None, cssom_sheet);
             }
             Resource::Image(_kind, width, height, image_data) => {
                 // Create the ImageData and cache it
@@ -2397,6 +2434,8 @@ impl BaseDocument {
                             rule: key.rule.clone(),
                             status: crate::font_face_events::FontFaceLoadStatus::Loaded,
                             url: res.resolved_url,
+                            sheet: key.cssom_sheet,
+                            path: key.cssom_path,
                         },
                     );
                 }
@@ -5090,6 +5129,19 @@ mod font_face_source_loop_tests {
             .expect("the sheet must hold a @font-face rule")
     }
 
+    /// A walk key for a rule the test holds outside any CSSOM sheet. These
+    /// tests read the event's status, not the address it reports, so the
+    /// sheet id and path are whatever a delivery would find.
+    fn walk_key(rule: &ServoArc<Locked<FontFaceRule>>, source_index: usize) -> FontFaceLoadKey {
+        FontFaceLoadKey {
+            rule: rule.clone(),
+            sheet_url: None,
+            source_index,
+            cssom_sheet: 0,
+            cssom_path: Vec::new(),
+        }
+    }
+
     /// Registers the bullet font under `alias` through the load path, so
     /// `local(alias)` has a family the collection answers for.
     fn register_bullet_font(document: &mut BaseDocument, alias: &str) {
@@ -5124,14 +5176,7 @@ mod font_face_source_loop_tests {
             &document,
             "@font-face { font-family: X; src: local(HeldFace), url(dead.svg) }",
         );
-        document.load_font_face_sources(
-            FontFaceLoadKey {
-                rule: rule.clone(),
-                sheet_url: None,
-                source_index: 0,
-            },
-            None,
-        );
+        document.load_font_face_sources(walk_key(&rule, 0), None);
         let events = document.take_pending_font_face_events();
         assert_eq!(events.len(), 1, "the skipped sources settle the rule once");
         assert_eq!(events[0].status, FontFaceLoadStatus::Error);
@@ -5154,11 +5199,7 @@ mod font_face_source_loop_tests {
             resolved_url: Some(String::from("test://dead")),
             image_key: None,
             origin_clean: false,
-            font_face: Some(FontFaceLoadKey {
-                rule: rule.clone(),
-                sheet_url: None,
-                source_index: 0,
-            }),
+            font_face: Some(walk_key(&rule, 0)),
             // Bytes that parse as no font face: the source failed.
             result: Ok(Resource::Font(
                 blitz_traits::net::Bytes::from_static(b"not a font at all"),

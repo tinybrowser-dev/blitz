@@ -467,57 +467,6 @@ impl BaseDocument {
         self.cssom_rule_count(self.node_cssom_sheet.get(&node_id).copied()?, path)
     }
 
-    /// The CSSOM address of one `@font-face` rule: the sheet id and the rule
-    /// path that names it in `document.styleSheets`, or `None` when no live
-    /// registered sheet holds it. An embedder uses the address to tell page
-    /// script which rule's font face settled
-    /// (<https://drafts.csswg.org/css-font-loading/#dom-fontface-status>).
-    pub fn cssom_font_face_rule_path(
-        &self,
-        font_face: &ServoArc<Locked<FontFaceRule>>,
-    ) -> Option<(u64, Vec<usize>)> {
-        let guard = self.guard.read();
-        for (sheet_id, record) in self.cssom_sheets.iter() {
-            if !record.live {
-                continue;
-            }
-            let rules = record.sheet.contents(&guard).rules.clone();
-            let mut path = Vec::new();
-            if let Some(found) = Self::find_font_face_rule(&rules, font_face, &guard, &mut path) {
-                return Some((*sheet_id, found));
-            }
-        }
-        None
-    }
-
-    /// Depth-first search for `font_face` under `rules`, extending `path`
-    /// with each descended rule's index. Answers the completed path.
-    fn find_font_face_rule(
-        rules: &ServoArc<Locked<CssRules>>,
-        font_face: &ServoArc<Locked<FontFaceRule>>,
-        guard: &SharedRwLockReadGuard,
-        path: &mut Vec<usize>,
-    ) -> Option<Vec<usize>> {
-        for (index, rule) in rules.read_with(guard).0.iter().enumerate() {
-            if let CssRule::FontFace(found) = rule {
-                if ServoArc::ptr_eq(found, font_face) {
-                    path.push(index);
-                    return Some(path.clone());
-                }
-                continue;
-            }
-            let Some(RuleList::Css(children)) = child_rule_list(rule, guard) else {
-                continue;
-            };
-            path.push(index);
-            if Self::find_font_face_rule(&children, font_face, guard, path).is_some() {
-                return Some(path.clone());
-            }
-            path.pop();
-        }
-        None
-    }
-
     /// [`Self::stylesheet_rule_count`] for a CSSOM sheet id, including a sheet
     /// that has left the document.
     pub fn cssom_rule_count(&self, sheet_id: u64, path: &[usize]) -> Option<usize> {
@@ -536,6 +485,9 @@ impl BaseDocument {
     /// `parentStyleSheet` and `ownerRule` point at the importing sheet and
     /// rule
     /// (<https://drafts.csswg.org/cssom/#dom-cssimportrule-stylesheet>).
+    /// The record [`Self::register_imported_cssom_sheet`] already made for
+    /// the imported sheet answers first, so the `@font-face` outcomes the
+    /// walk reported under it stay findable at the id script sees.
     pub fn cssom_import_sheet(&mut self, sheet_id: u64, path: &[usize]) -> Option<u64> {
         let record = self.cssom_sheets.get(&sheet_id)?;
         let sheet = record.sheet.clone();
@@ -554,19 +506,48 @@ impl BaseDocument {
                 ImportSheet::Pending | ImportSheet::Refused => return None,
             }
         };
+        if let Some(existing) = self
+            .imported_cssom_sheets
+            .iter()
+            .find(|(registered, _)| ServoArc::ptr_eq(registered, &imported.0))
+        {
+            return Some(existing.1);
+        }
+        Some(self.register_imported_cssom_sheet(&imported, origin_clean))
+    }
+
+    /// The CSSOM id for an `@import`-loaded sheet, registering it under a
+    /// fresh id on first use. The record has no owner node. `load_resource`
+    /// registers when the import installs the sheet, so the `@font-face` walk
+    /// reports its rules at the id script later gets from
+    /// `CSSImportRule.styleSheet`; the second call answers that same record.
+    /// Sheets are keyed by identity because one import rule keeps one sheet.
+    pub fn register_imported_cssom_sheet(
+        &mut self,
+        sheet: &DocumentStyleSheet,
+        origin_clean: bool,
+    ) -> u64 {
+        if let Some((_, id)) = self
+            .imported_cssom_sheets
+            .iter()
+            .find(|(registered, _)| ServoArc::ptr_eq(registered, &sheet.0))
+        {
+            return *id;
+        }
         let id = self.next_cssom_sheet;
         self.next_cssom_sheet = self.next_cssom_sheet.saturating_add(1);
         self.cssom_sheets.insert(
             id,
             CssomSheetRecord {
-                sheet: imported,
+                sheet: sheet.clone(),
                 origin_clean,
                 live: true,
                 owner: None,
                 constructable: false,
             },
         );
-        Some(id)
+        self.imported_cssom_sheets.push((sheet.0.clone(), id));
+        id
     }
 
     /// Parses `text` as a media query list. An invalid list parses to the
@@ -1003,7 +984,11 @@ impl BaseDocument {
         }
         drop(guard);
         if let Some(rule) = inserted_font_face {
-            self.load_font_face_rule(&rule, None, owner);
+            // The rule's CSSOM address is the list's path plus its index;
+            // its outcome reports there.
+            let mut rule_path = path.to_vec();
+            rule_path.push(index);
+            self.load_font_face_rule(&rule, None, owner, sheet_id, &rule_path);
         }
         Ok(index)
     }

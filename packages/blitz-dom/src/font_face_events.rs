@@ -22,6 +22,13 @@ pub struct PendingFontFaceEvent {
     /// The final URL of the source that settled the rule, when the settling
     /// source had one.
     pub url: Option<String>,
+    /// The rule's CSSOM address at the time the walk started: the sheet id
+    /// and the rule path that names it in `document.styleSheets`. The walk
+    /// records it rather than resolving it at delivery, because a
+    /// re-processed style element replaces its sheet and leaves the rule
+    /// unfindable by then.
+    pub sheet: u64,
+    pub path: Vec<usize>,
 }
 
 /// The terminal state of one rule's source list.
