@@ -153,7 +153,9 @@ impl<'a> TNode for BlitzNode<'a> {
     //
     // For the sake of this demo, we're just going to return the parent node ann
     fn traversal_parent(&self) -> Option<Self::ConcreteElement> {
-        self.parent_node().and_then(|node| node.as_element())
+        self.0
+            .flat_parent()
+            .and_then(|id| BlitzNode(self.0.with(id)).as_element())
     }
 
     fn opaque(&self) -> OpaqueNode {
@@ -895,7 +897,7 @@ impl<'a> Iterator for Traverser<'a> {
     type Item = BlitzNode<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let node_id = self.parent.children.get(self.child_index)?;
+        let node_id = self.parent.flat_children().get(self.child_index)?;
         let node = self.parent.0.with(*node_id);
 
         self.child_index += 1;

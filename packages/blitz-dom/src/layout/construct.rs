@@ -29,8 +29,8 @@ use crate::{
 };
 
 use super::{
-    damage::ALL_DAMAGE, list::collect_list_item_children, replaced::is_inline_box_element,
-    table::build_table_context,
+    damage::ALL_DAMAGE, inline::drop_down_select_shown_text, list::collect_list_item_children,
+    replaced::is_inline_box_element, table::build_table_context,
 };
 
 const DUMMY_NAME: QualName = qual_name!("div", html);
@@ -182,7 +182,7 @@ fn push_children_and_pseudos(layout_children: &mut ThinVec<NodeId>, node: &Node)
     if let Some(before) = node.before() {
         layout_children.push(before);
     }
-    layout_children.extend(node.children.iter().copied().filter(|child_id| {
+    layout_children.extend(node.flat_children().iter().copied().filter(|child_id| {
         let child_node = node.with(*child_id);
         child_node.data.kind() != NodeKind::Comment
     }));
@@ -274,7 +274,7 @@ fn push_non_whitespace_children_and_pseudos(layout_children: &mut ThinVec<NodeId
     if let Some(before) = node.before() {
         layout_children.push(before);
     }
-    layout_children.extend(node.children.iter().copied().filter(|child_id| {
+    layout_children.extend(node.flat_children().iter().copied().filter(|child_id| {
         let child_node = node.with(*child_id);
         !child_node.is_whitespace_node() && child_node.data.kind() != NodeKind::Comment
     }));
@@ -321,7 +321,7 @@ fn classify_flow_children(
     // in the container's formatting context, and any other pseudo generates its own
     // inline or block box in that formatting context.
     let pseudo_ids = node.before().into_iter().chain(node.after());
-    let child_ids = node.children.iter().copied().chain(pseudo_ids);
+    let child_ids = node.flat_children().iter().copied().chain(pseudo_ids);
     for child_id in child_ids {
         let child = &doc.nodes[child_id];
 
@@ -501,7 +501,7 @@ fn collect_layout_children_with_wrap(
     // Skip further construction if the node has no children or psuedo-children
     {
         let node = &doc.nodes[container_node_id];
-        if node.children.is_empty() && node.before().is_none() && node.after().is_none() {
+        if node.flat_children().is_empty() && node.before().is_none() && node.after().is_none() {
             return;
         }
     }
@@ -528,7 +528,7 @@ fn collect_layout_children_with_wrap(
             // display:contents hoists its text content into the container.
             let container = &doc.nodes[container_node_id];
             let has_text_node_or_contents = container
-                .children
+                .flat_children()
                 .iter()
                 .copied()
                 .chain(container.before())
@@ -593,6 +593,15 @@ fn collect_layout_children_with_wrap(
         _ => {
             let mut classification = FlowClassification::default();
             classify_flow_children(doc, container_node_id, &mut classification);
+
+            // https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+            // A drop-down select has no in-flow children — its options never
+            // enter layout — but still owns an inline context: its shown text.
+            if drop_down_select_shown_text(&doc.nodes, container_node_id).is_some() {
+                classification.all_inline = true;
+                classification.all_block = false;
+                classification.all_out_of_flow = false;
+            }
 
             // Inline box whose in-flow content is block-level only: it is laid out as block
             // boxes, so paint must not draw its own box over them.
@@ -827,7 +836,11 @@ fn collect_complex_layout_children(
     hide_whitespace: bool,
     needs_wrap: fn(NodeKind, DisplayOutside) -> bool,
 ) {
-    doc.iter_children_and_pseudos_mut(container_node_id, |child_id, doc| {
+    let flat_target = doc.nodes[container_node_id]
+        .element_data()
+        .and_then(|el| el.shadow_root)
+        .unwrap_or(container_node_id);
+    doc.iter_children_and_pseudos_mut(flat_target, |child_id, doc| {
         // Get node kind (text, element, comment, etc)
         let child_node_kind = doc.nodes[child_id].data.kind();
 
@@ -966,9 +979,13 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     inline_context_root_node_id: NodeId,
     layout_children: &mut ThinVec<NodeId>,
 ) {
-    flush_inline_pseudos_recursive(doc, inline_context_root_node_id);
+    let flat_target = doc.nodes[inline_context_root_node_id]
+        .element_data()
+        .and_then(|el| el.shadow_root)
+        .unwrap_or(inline_context_root_node_id);
+    flush_inline_pseudos_recursive(doc, flat_target);
 
-    iter_children_and_pseudos!(doc.nodes[inline_context_root_node_id], |child_id| {
+    iter_children_and_pseudos!(doc.nodes[flat_target], |child_id| {
         find_inline_layout_embedded_boxes_recursive(
             &mut doc.nodes,
             inline_context_root_node_id,

@@ -973,6 +973,15 @@ impl DocumentMutator<'_> {
                     element.store_selectedness(selected, dirtiness);
                 }
             });
+        // https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+        // The drop-down's shown text follows selectedness.
+        if selected
+            && let Some(select) = self.doc.nearest_ancestor_select(node_id, false)
+        {
+            let node = &mut self.doc.nodes[select];
+            node.insert_damage(ALL_DAMAGE);
+            node.mark_ancestors_dirty();
+        }
     }
 
     /// Sets the indeterminate flag
@@ -1919,6 +1928,8 @@ impl<'doc> DocumentMutator<'doc> {
                 .flags
                 .set(NodeFlags::IS_IN_DOCUMENT, true);
         }
+        self.doc.nodes[host].insert_damage(ALL_DAMAGE);
+        self.doc.nodes[host].mark_ancestors_dirty();
         id
     }
 

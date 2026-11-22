@@ -60,6 +60,13 @@ input {
     display: inline-block;
 }
 
+/* https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+   (the spec leaves the exact default box to the UA; the inline-block default
+   matches the rendering section's form-control baseline) */
+select {
+    display: inline-block;
+}
+
 /* https://html.spec.whatwg.org/#hidden-elements */
 input[type="hidden" i] {
     display: none !important;
@@ -185,6 +192,13 @@ legend {
 
 option {
     display: none;
+}
+
+/* https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+   (a select rendered as a list box shows its options as rows) */
+select[multiple] option,
+select[size]:not([size="1"]):not([size="0"]) option {
+    display: block;
 }
 
 source {
@@ -1176,4 +1190,8 @@ slot {
         pointer-events: none !important;
         background-color: transparent;
     }
+}
+
+[contenteditable]:not([contenteditable="false" i]):empty {
+    min-height: 1em;
 }

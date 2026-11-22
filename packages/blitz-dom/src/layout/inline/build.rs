@@ -87,6 +87,17 @@ pub(crate) fn build_inline_layout_into(
     let mut text_transformer = TextTransformer::default();
     text_transformer.word_break(&builder);
 
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+    // A select rendered as a drop-down box shows the label of its selected
+    // option; the options themselves never enter layout.
+    if let Some(text) = drop_down_select_shown_text(nodes, inline_context_root_node_id)
+        && !text.is_empty()
+    {
+        builder.push_text(&text);
+        text_layout.text = builder.build_into(&mut text_layout.layout);
+        return;
+    }
+
     if let Some(before_id) = root_node.before() {
         build_inline_layout_recursive(
             &mut builder,
@@ -96,7 +107,7 @@ pub(crate) fn build_inline_layout_into(
             &text_transform,
         );
     }
-    for child_id in root_node.children.iter().copied() {
+    for child_id in root_node.flat_children().iter().copied() {
         build_inline_layout_recursive(
             &mut builder,
             &mut text_transformer,
@@ -178,7 +189,7 @@ pub(crate) fn build_inline_layout_into(
                                 .as_ref()
                                 .map_or(&[][..], |styles| styles.as_slice()),
                         );
-                        for child_id in node.children.iter().copied() {
+                        for child_id in node.flat_children().iter().copied() {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             build_inline_layout_recursive(
                                 builder,
@@ -244,7 +255,7 @@ pub(crate) fn build_inline_layout_into(
                                 );
                             }
 
-                            for child_id in node.children.iter().copied() {
+                            for child_id in node.flat_children().iter().copied() {
                                 build_inline_layout_recursive(
                                     builder,
                                     text_transformer,
@@ -312,4 +323,67 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Document(_) => unreachable!(),
         }
     }
+}
+
+// https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+// A select without `multiple` and with a display size of one renders as a
+// drop-down box whose shown text is the label of its selected option; an
+// authored <selectedcontent> renders that text itself.
+pub(crate) fn drop_down_select_shown_text(
+    nodes: &crate::NodeTree,
+    select_id: NodeId,
+) -> Option<String> {
+    let select = &nodes[select_id];
+    let element = select.element_data()?;
+    if element.name.local != local_name!("select") || element.has_attr(local_name!("multiple")) {
+        return None;
+    }
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-size
+    let display_size = element
+        .attr(local_name!("size"))
+        .and_then(|size| size.trim().parse::<u32>().ok())
+        .unwrap_or(1);
+    if display_size > 1 {
+        return None;
+    }
+    let mut stack: Vec<NodeId> = select.children.iter().rev().copied().collect();
+    while let Some(current) = stack.pop() {
+        let node = &nodes[current];
+        if node
+            .element_data()
+            .is_some_and(|element| element.name.local == local_name!("selectedcontent"))
+        {
+            return None;
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    stack = select.children.iter().rev().copied().collect();
+    while let Some(current) = stack.pop() {
+        let node = &nodes[current];
+        if !node
+            .element_data()
+            .is_some_and(|element| element.name.local == local_name!("option"))
+        {
+            stack.extend(node.children.iter().rev().copied());
+            continue;
+        }
+        if node
+            .element_data()
+            .is_some_and(|element| element.selectedness())
+        {
+            return Some(option_label(node));
+        }
+    }
+    Some(String::new())
+}
+
+// https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-label
+fn option_label(node: &crate::node::Node) -> String {
+    if let Some(label) = node
+        .element_data()
+        .and_then(|element| element.attr(local_name!("label")))
+    {
+        return label.to_owned();
+    }
+    node.text_content()
 }

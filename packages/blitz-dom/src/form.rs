@@ -365,7 +365,11 @@ impl BaseDocument {
     /// ancestor, and at a second `optgroup`: an `optgroup` counts itself, so a
     /// nested `optgroup` has none, and an `option` may have one
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#option-element-nearest-ancestor-select>).
-    fn nearest_ancestor_select(&self, node_id: NodeId, self_is_optgroup: bool) -> Option<NodeId> {
+    pub(crate) fn nearest_ancestor_select(
+        &self,
+        node_id: NodeId,
+        self_is_optgroup: bool,
+    ) -> Option<NodeId> {
         let mut seen_optgroup = self_is_optgroup;
         let mut current = node_id;
         while let Some(parent) = self.get_node(current).and_then(|node| node.parent) {

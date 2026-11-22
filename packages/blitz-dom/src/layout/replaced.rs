@@ -456,4 +456,7 @@ pub(crate) fn is_inline_box_element(tag_name: &LocalName) -> bool {
         || *tag_name == local_name!("input")
         || *tag_name == local_name!("textarea")
         || *tag_name == local_name!("button")
+        // https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+        // — a select renders as an inline-block box.
+        || *tag_name == local_name!("select")
 }

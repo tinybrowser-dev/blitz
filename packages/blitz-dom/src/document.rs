@@ -2788,7 +2788,8 @@ impl BaseDocument {
             return None;
         }
 
-        let Some(hit) = self.hit(x, y) else {
+        let scroll = self.viewport_scroll();
+        let Some(hit) = self.hit(x + scroll.x as f32, y + scroll.y as f32) else {
             // The point is within the viewport but over no box: the root element
             // (which covers the viewport in an HTML document) is the hit target
             return self.try_root_element().map(|root| root.id);
@@ -2821,9 +2822,14 @@ impl BaseDocument {
             return Vec::new();
         }
 
+        let scroll = self.viewport_scroll();
         let mut collector = crate::node::HitCollector::all();
-        self.root_element()
-            .hit_inner(x, y, self.viewport().scale_f64(), &mut collector);
+        self.root_element().hit_inner(
+            x + scroll.x as f32,
+            y + scroll.y as f32,
+            self.viewport().scale_f64(),
+            &mut collector,
+        );
         let hits = collector.into_hits();
         if hits.is_empty() {
             // The point is within the viewport but over no box: the root
