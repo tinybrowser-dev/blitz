@@ -175,13 +175,26 @@ impl BaseDocument {
         self.subdoc_is_animating = subdoc_is_animating;
         timer.record_time("subdocs");
 
-        // An animation or a smooth scroll needs another pass even though no
-        // mutation will ask for one; the frame loop calls resolve directly.
-        if self.is_animating() {
-            self.has_changes = true;
-        }
+        // An animation or a smooth scroll keeps the frame loop running, which
+        // calls [`Self::resolve`] directly; it is not pending style or layout
+        // work, so it must not keep [`Self::has_changes`] set. Layout readers
+        // use [`Self::resolve_if_needed`], and a permanently set flag would
+        // make every read re-run the whole pipeline.
 
         timer.print_times(&format!("Resolve({}): ", self.id()));
+    }
+
+    /// Resolve pending style and layout work without sampling animations.
+    ///
+    /// Layout reads use this to flush earlier DOM mutations and resource
+    /// arrivals synchronously. The animation clock belongs to the frame loop:
+    /// a page with a running animation does not re-run the pipeline for every
+    /// `getBoundingClientRect` or `getComputedStyle` read.
+    pub fn resolve_if_needed(&mut self, current_time_for_animations: f64) {
+        self.handle_messages();
+        if self.has_changes {
+            self.resolve(current_time_for_animations);
+        }
     }
 
     fn resolve_transforms(&mut self, node_id: NodeId, resolve_all: bool) -> Rect {
