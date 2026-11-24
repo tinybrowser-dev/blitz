@@ -32,7 +32,8 @@ use super::{
     damage::ALL_DAMAGE,
     inline::{drop_down_select_shown_text, option_shown_text},
     list::collect_list_item_children,
-    replaced::is_inline_box_element, table::build_table_context,
+    replaced::is_inline_box_element,
+    table::build_table_context,
 };
 
 const DUMMY_NAME: QualName = qual_name!("div", html);
@@ -216,6 +217,14 @@ fn text_item_needs_wrap(child_node_kind: NodeKind, _display_outside: DisplayOuts
     child_node_kind == NodeKind::Text
 }
 
+fn clear_stale_layout_box(doc: &mut BaseDocument, node_id: NodeId) {
+    doc.nodes[node_id].layout_children.borrow_mut().take();
+    let old_anon = std::mem::take(&mut doc.nodes[node_id].anonymous_blocks);
+    for anon_id in old_anon {
+        doc.deallocate_anonymous_block(anon_id);
+    }
+}
+
 /// Push a single hoisted child, recursing through display:contents nodes and
 /// wrapping text/inline children per the ancestor container's `WrapContext`.
 fn push_hoisted_child(
@@ -227,6 +236,7 @@ fn push_hoisted_child(
     let child = &doc.nodes[child_id];
     let child_display = child.display_style().unwrap_or(Display::inline());
     if matches!(child_display.inside(), DisplayInside::Contents) {
+        clear_stale_layout_box(doc, child_id);
         collect_layout_children_with_wrap(doc, child_id, out, wrap);
         return;
     }
@@ -522,10 +532,13 @@ fn collect_layout_children_with_wrap(
     );
 
     match container_display.inside() {
-        DisplayInside::None => {}
+        DisplayInside::None => {
+            clear_stale_layout_box(doc, container_node_id);
+        }
         DisplayInside::Contents => {
             doc.nodes[container_node_id]
                 .remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
+            clear_stale_layout_box(doc, container_node_id);
             // display:contents is transparent for box generation: hoist the
             // children THEMSELVES (not their layout children) into the
             // parent, recursing only through nested contents nodes.
@@ -878,6 +891,7 @@ fn collect_complex_layout_children(
         // Recurse into `Display::Contents` nodes, wrapping hoisted text and
         // inline children as if they were direct children of this container
         else if display_inside == DisplayInside::Contents {
+            clear_stale_layout_box(doc, child_id);
             let wrap = Some(WrapContext {
                 container_node_id,
                 needs_wrap,
@@ -997,7 +1011,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
 
     iter_children_and_pseudos!(doc.nodes[flat_target], |child_id| {
         find_inline_layout_embedded_boxes_recursive(
-            &mut doc.nodes,
+            doc,
             inline_context_root_node_id,
             child_id,
             layout_children,
@@ -1022,85 +1036,102 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     }
 
     fn find_inline_layout_embedded_boxes_recursive(
-        nodes: &mut crate::NodeTree,
+        doc: &mut BaseDocument,
         parent_id: NodeId,
         node_id: NodeId,
         layout_children: &mut ThinVec<NodeId>,
     ) {
-        let node = &mut nodes[node_id];
+        let node = &mut doc.nodes[node_id];
 
         // Set layout_parent for node.
         node.layout_parent.set(Some(parent_id));
 
-        match &node.data {
+        enum Action {
+            Push,
+            ClearOnly,
+            ClearAndRecurseChildren(NodeId),
+            ClearAndRecurseChildrenAndPseudos(NodeId),
+            None,
+        }
+
+        let action = match &node.data {
             NodeData::Element(element_data) | NodeData::AnonymousBlock(element_data) => {
                 // if the input type is hidden, hide it
-                if *element_data.name.local == *"input" {
-                    if let Some("hidden") = element_data.attr(local_name!("type")) {
-                        return;
+                if *element_data.name.local == *"input"
+                    && let Some("hidden") = element_data.attr(local_name!("type"))
+                {
+                    Action::ClearOnly
+                } else {
+                    let display = node.display_style().unwrap_or(Display::inline());
+                    match (display.outside(), display.inside()) {
+                        (DisplayOutside::None, DisplayInside::None) => {
+                            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                            Action::ClearOnly
+                        }
+                        (DisplayOutside::None, DisplayInside::Contents) => {
+                            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                            Action::ClearAndRecurseChildren(parent_id)
+                        }
+                        (DisplayOutside::Inline, DisplayInside::Flow) => {
+                            let tag_name = &element_data.name.local;
+                            if is_inline_box_element(tag_name) {
+                                Action::Push
+                            } else if *tag_name == local_name!("br") {
+                                node.remove_damage(
+                                    CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX,
+                                );
+                                Action::ClearOnly
+                            } else {
+                                node.remove_damage(
+                                    CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX,
+                                );
+                                Action::ClearAndRecurseChildrenAndPseudos(node_id)
+                            }
+                        }
+                        // Inline box
+                        (_, _) => Action::Push,
                     }
                 }
-
-                let display = node.display_style().unwrap_or(Display::inline());
-
-                match (display.outside(), display.inside()) {
-                    (DisplayOutside::None, DisplayInside::None) => {
-                        node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                    }
-                    (DisplayOutside::None, DisplayInside::Contents) => {
-                        node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                        iter_children!(nodes[node_id], |child_id| {
-                            find_inline_layout_embedded_boxes_recursive(
-                                nodes,
-                                parent_id,
-                                child_id,
-                                layout_children,
-                            );
-                        });
-                    }
-                    (DisplayOutside::Inline, DisplayInside::Flow) => {
-                        let tag_name = &element_data.name.local;
-
-                        if is_inline_box_element(tag_name) {
-                            layout_children.push(node_id);
-                        } else if *tag_name == local_name!("br") {
-                            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                        } else {
-                            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                            iter_children_and_pseudos!(nodes[node_id], |child_id| {
-                                find_inline_layout_embedded_boxes_recursive(
-                                    nodes,
-                                    node_id,
-                                    child_id,
-                                    layout_children,
-                                );
-                            });
-                        }
-                    }
-                    // Inline box
-                    (_, _) => {
-                        layout_children.push(node_id);
-                    }
-                };
             }
-            NodeData::Comment { .. } | NodeData::Text(_) => {
-                node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            }
-            // Fragments never generate boxes themselves; their children are
-            // processed through their own parents (template contents are
-            // detached and never reach layout at all).
-            NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => {
-                node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            }
-            // Doctype, processing instructions, and CDATA sections never
-            // generate boxes: CDATA contributes only character data to its
-            // parent's text, like a comment contributes nothing.
-            NodeData::Doctype { .. }
+            NodeData::Comment { .. }
+            | NodeData::Text(_)
+            | NodeData::Fragment { .. }
+            | NodeData::ShadowRoot { .. }
+            | NodeData::Doctype { .. }
             | NodeData::ProcessingInstruction { .. }
             | NodeData::CDataSection { .. } => {
                 node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                Action::None
             }
             NodeData::Document(_) => unreachable!(),
+        };
+
+        match action {
+            Action::Push => layout_children.push(node_id),
+            Action::ClearOnly => clear_stale_layout_box(doc, node_id),
+            Action::ClearAndRecurseChildren(next_parent) => {
+                clear_stale_layout_box(doc, node_id);
+                iter_children!(doc.nodes[node_id], |child_id| {
+                    find_inline_layout_embedded_boxes_recursive(
+                        doc,
+                        next_parent,
+                        child_id,
+                        layout_children,
+                    );
+                });
+            }
+            Action::ClearAndRecurseChildrenAndPseudos(next_parent) => {
+                clear_stale_layout_box(doc, node_id);
+                iter_children_and_pseudos!(doc.nodes[node_id], |child_id| {
+                    find_inline_layout_embedded_boxes_recursive(
+                        doc,
+                        next_parent,
+                        child_id,
+                        layout_children,
+                    );
+                });
+            }
+            Action::None => {}
         }
     }
 }
@@ -1144,5 +1175,57 @@ mod tests {
         let document_node = document.get_node(document_id).unwrap();
         assert!(!document_node.flags.is_inline_root());
         assert!(document_node.element_data().is_none());
+    }
+
+    #[test]
+    fn display_contents_and_inline_clear_stale_layout_children() {
+        let mut document = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        let doc_id = document.root_node().id;
+        let html = document.create_node(NodeData::Element(Box::new(
+            crate::node::ElementData::new(qual_name!("html"), vec![]),
+        )));
+        let body = document.create_node(NodeData::Element(Box::new(
+            crate::node::ElementData::new(qual_name!("body"), vec![]),
+        )));
+        let outer = document.create_node(NodeData::Element(Box::new(
+            crate::node::ElementData::new(qual_name!("div"), vec![]),
+        )));
+        let wrapper = document.create_node(NodeData::Element(Box::new(
+            crate::node::ElementData::new(qual_name!("div"), vec![]),
+        )));
+        let inner = document.create_node(NodeData::Element(Box::new(
+            crate::node::ElementData::new(qual_name!("span"), vec![]),
+        )));
+        {
+            let mut mutator = document.mutate();
+            mutator.set_style_property(inner, "display", "inline-block");
+            mutator.append_children(doc_id, &[html]);
+            mutator.append_children(html, &[body]);
+            mutator.append_children(body, &[outer]);
+            mutator.append_children(outer, &[wrapper]);
+            mutator.append_children(wrapper, &[inner]);
+        }
+        document.resolve(0.0);
+
+        {
+            let mut mutator = document.mutate();
+            mutator.set_style_property(wrapper, "display", "contents");
+        }
+        document.resolve(0.0);
+
+        {
+            let mut mutator = document.mutate();
+            mutator.set_style_property(wrapper, "display", "block");
+        }
+        document.resolve(0.0);
+
+        {
+            let mut mutator = document.mutate();
+            mutator.set_style_property(wrapper, "display", "inline");
+        }
+        document.resolve(0.0);
     }
 }
