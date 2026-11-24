@@ -29,7 +29,9 @@ use crate::{
 };
 
 use super::{
-    damage::ALL_DAMAGE, inline::drop_down_select_shown_text, list::collect_list_item_children,
+    damage::ALL_DAMAGE,
+    inline::{drop_down_select_shown_text, option_shown_text},
+    list::collect_list_item_children,
     replaced::is_inline_box_element, table::build_table_context,
 };
 
@@ -501,7 +503,13 @@ fn collect_layout_children_with_wrap(
     // Skip further construction if the node has no children or psuedo-children
     {
         let node = &doc.nodes[container_node_id];
-        if node.flat_children().is_empty() && node.before().is_none() && node.after().is_none() {
+        if node.flat_children().is_empty()
+            && node.before().is_none()
+            && node.after().is_none()
+            && option_shown_text(&doc.nodes, container_node_id)
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
             return;
         }
     }
@@ -597,7 +605,9 @@ fn collect_layout_children_with_wrap(
             // https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
             // A drop-down select has no in-flow children — its options never
             // enter layout — but still owns an inline context: its shown text.
-            if drop_down_select_shown_text(&doc.nodes, container_node_id).is_some() {
+            if drop_down_select_shown_text(&doc.nodes, container_node_id).is_some()
+                || option_shown_text(&doc.nodes, container_node_id).is_some()
+            {
                 classification.all_inline = true;
                 classification.all_block = false;
                 classification.all_out_of_flow = false;

@@ -5505,4 +5505,144 @@ mod cascade_position_tests {
         assert_eq!(doc.nodes[child].parent, Some(shadow));
         doc.resolve(0.0);
     }
+
+    #[test]
+    fn shadow_host_styles_light_and_shadow_children() {
+        let mut doc = document();
+        let root = doc.root_node().id;
+        let (shadow_child, light_child) = {
+            let mut mutator = doc.mutate();
+            let html = mutator.create_element(qual_name!("html"), vec![]);
+            let body = mutator.create_element(qual_name!("body"), vec![]);
+            let host = mutator.create_element(qual_name!("div"), vec![]);
+            mutator.append_children(body, &[host]);
+            mutator.append_children(html, &[body]);
+            mutator.append_children(root, &[html]);
+            let shadow = mutator.attach_shadow_root(host, false);
+            let shadow_child = mutator.create_element(qual_name!("p"), vec![]);
+            mutator.append_children(shadow, &[shadow_child]);
+            let light_child = mutator.create_element(qual_name!("span"), vec![]);
+            mutator.append_children(host, &[light_child]);
+            (shadow_child, light_child)
+        };
+        doc.resolve(0.0);
+        assert!(doc.nodes[shadow_child].primary_styles().is_some());
+        assert!(doc.nodes[light_child].primary_styles().is_some());
+    }
+
+    #[test]
+    fn position_fixed_element_from_point_while_scrolled() {
+        let mut doc = document();
+        doc.set_viewport(blitz_traits::shell::Viewport::new(
+            800,
+            600,
+            1.0,
+            ColorScheme::Light,
+        ));
+        let root = doc.root_node().id;
+        let (fixed, fixed_hoisted) = {
+            let mut mutator = doc.mutate();
+            let html = mutator.create_element(
+                qual_name!("html"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block;".into(),
+                }],
+            );
+            let body = mutator.create_element(
+                qual_name!("body"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block; margin: 0; height: 3000px;".into(),
+                }],
+            );
+            let fixed = mutator.create_element(
+                qual_name!("button"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block; position: fixed; top: 0; left: 0; width: 200px; height: 40px;".into(),
+                }],
+            );
+            let fixed_hoisted = mutator.create_element(
+                qual_name!("button"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block; position: fixed; top: 100px; left: 0; width: 200px; height: 40px; z-index: 10;".into(),
+                }],
+            );
+            mutator.append_children(body, &[fixed, fixed_hoisted]);
+            mutator.append_children(html, &[body]);
+            mutator.append_children(root, &[html]);
+            (fixed, fixed_hoisted)
+        };
+        doc.resolve(0.0);
+        assert_eq!(doc.element_from_point(50.0, 20.0), Some(fixed));
+        assert_eq!(doc.element_from_point(50.0, 120.0), Some(fixed_hoisted));
+        doc.set_viewport_scroll(crate::Point { x: 0.0, y: 500.0 });
+        assert_eq!(doc.element_from_point(50.0, 20.0), Some(fixed));
+        assert_eq!(doc.element_from_point(50.0, 120.0), Some(fixed_hoisted));
+    }
+
+    #[test]
+    fn option_label_handles_empty_attr_whitespace_and_listbox_label() {
+        let mut doc = document();
+        let root = doc.root_node().id;
+        let (opt_empty, opt_label, opt_ws) = {
+            let mut mutator = doc.mutate();
+            let html = mutator.create_element(qual_name!("html"), vec![]);
+            let body = mutator.create_element(qual_name!("body"), vec![]);
+            let select = mutator.create_element(
+                qual_name!("select"),
+                vec![Attribute {
+                    name: qual_name!("size"),
+                    value: "4".into(),
+                }],
+            );
+            let opt_empty = mutator.create_element(
+                qual_name!("option"),
+                vec![Attribute {
+                    name: qual_name!("label"),
+                    value: "".into(),
+                }],
+            );
+            let t1 = mutator.create_text_node("  Fallback   Text  ");
+            mutator.append_children(opt_empty, &[t1]);
+
+            let opt_label = mutator.create_element(
+                qual_name!("option"),
+                vec![Attribute {
+                    name: qual_name!("label"),
+                    value: "Label Text".into(),
+                }],
+            );
+            let t2 = mutator.create_text_node("Element Text");
+            mutator.append_children(opt_label, &[t2]);
+
+            let opt_ws = mutator.create_element(qual_name!("option"), vec![]);
+            let t3 = mutator.create_text_node("\n  Alpha\t\tBeta \n");
+            let script = mutator.create_element(qual_name!("script"), vec![]);
+            let st = mutator.create_text_node("ignored()");
+            mutator.append_children(script, &[st]);
+            mutator.append_children(opt_ws, &[t3, script]);
+
+            mutator.append_children(select, &[opt_empty, opt_label, opt_ws]);
+            mutator.append_children(body, &[select]);
+            mutator.append_children(html, &[body]);
+            mutator.append_children(root, &[html]);
+            (opt_empty, opt_label, opt_ws)
+        };
+        doc.resolve(0.0);
+        assert_eq!(
+            crate::layout::inline::option_shown_text(&doc.nodes, opt_empty).as_deref(),
+            Some("Fallback Text")
+        );
+        assert_eq!(
+            crate::layout::inline::option_shown_text(&doc.nodes, opt_label).as_deref(),
+            Some("Label Text")
+        );
+        assert_eq!(
+            crate::layout::inline::option_shown_text(&doc.nodes, opt_ws).as_deref(),
+            Some("Alpha Beta")
+        );
+    }
 }

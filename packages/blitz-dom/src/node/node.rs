@@ -1721,7 +1721,16 @@ impl Node {
             && y >= (overflow.y0 / scale) as f32
             && y <= (overflow.y1 / scale) as f32;
 
-        if !matches_self && !matches_content && !matches_hoisted_content && !matches_overflow {
+        let is_root_element = self
+            .containing_block()
+            .is_none_or(|cb| matches!(self.tree()[cb].data, NodeData::Document(_)));
+
+        if !is_root_element
+            && !matches_self
+            && !matches_content
+            && !matches_hoisted_content
+            && !matches_overflow
+        {
             return;
         }
 
@@ -1789,7 +1798,7 @@ impl Node {
                 // against the viewport and do not scroll with it. (A fixed box
                 // whose containing block is a transformed ancestor scrolls with
                 // that ancestor like any other out-of-flow box.)
-                if child_position == taffy::Position::Fixed && self.containing_block().is_none() {
+                if child_position == taffy::Position::Fixed && is_root_element {
                     child_x -= self.scroll_offset().x as f32;
                     child_y -= self.scroll_offset().y as f32;
                     let viewport_scroll = self.tree().viewport_scroll();

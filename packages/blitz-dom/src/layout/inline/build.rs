@@ -89,11 +89,14 @@ pub(crate) fn build_inline_layout_into(
 
     // https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
     // A select rendered as a drop-down box shows the label of its selected
-    // option; the options themselves never enter layout.
+    // option; a listbox option renders its label rather than raw DOM children.
     if let Some(text) = drop_down_select_shown_text(nodes, inline_context_root_node_id)
-        && !text.is_empty()
+        .or_else(|| option_shown_text(nodes, inline_context_root_node_id))
     {
-        builder.push_text(&text);
+        if !text.is_empty() {
+            let transformed = text_transformer.transform(&text, &text_transform, &builder);
+            builder.push_text(transformed);
+        }
         text_layout.text = builder.build_into(&mut text_layout.layout);
         return;
     }
@@ -377,13 +380,58 @@ pub(crate) fn drop_down_select_shown_text(
     Some(String::new())
 }
 
+// https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+pub(crate) fn option_shown_text(nodes: &crate::NodeTree, option_id: NodeId) -> Option<String> {
+    let option = &nodes[option_id];
+    let element = option.element_data()?;
+    if element.name.local != local_name!("option") {
+        return None;
+    }
+    Some(option_label(option))
+}
+
 // https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-label
+// https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+// https://infra.spec.whatwg.org/#strip-and-collapse-ascii-whitespace
 fn option_label(node: &crate::node::Node) -> String {
     if let Some(label) = node
         .element_data()
         .and_then(|element| element.attr(local_name!("label")))
+        .filter(|label| !label.is_empty())
     {
         return label.to_owned();
     }
-    node.text_content()
+    let mut raw = String::new();
+    collect_option_text(node, &mut raw);
+    let mut collapsed = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        if matches!(ch, '\t' | '\n' | '\x0C' | '\r' | ' ') {
+            if !collapsed.is_empty() {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                collapsed.push(' ');
+                pending_space = false;
+            }
+            collapsed.push(ch);
+        }
+    }
+    collapsed
+}
+
+fn collect_option_text(node: &crate::node::Node, out: &mut String) {
+    for &child_id in &node.children {
+        let child = node.with(child_id);
+        match &child.data {
+            NodeData::Text(text) => out.push_str(&text.content),
+            NodeData::Element(el) => {
+                if el.name.local != local_name!("script") {
+                    collect_option_text(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }

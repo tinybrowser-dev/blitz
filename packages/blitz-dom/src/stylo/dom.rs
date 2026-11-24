@@ -205,7 +205,9 @@ impl selectors::Element for BlitzNode<'_> {
     }
 
     fn parent_element(&self) -> Option<Self> {
-        TElement::traversal_parent(self)
+        self.0
+            .parent
+            .and_then(|id| BlitzNode(self.0.with(id)).as_element())
     }
 
     fn parent_node_is_shadow_root(&self) -> bool {
@@ -754,6 +756,10 @@ impl<'a> TElement for BlitzNode<'a> {
         None
     }
 
+    fn inheritance_parent(&self) -> Option<Self> {
+        TElement::traversal_parent(self)
+    }
+
     fn get_attr(&self, attr: &style::LocalName, ns: &style::Namespace) -> Option<String> {
         // TODO: case-insensitive matching for HTML-ns attrs
         self.attrs()?
@@ -897,8 +903,19 @@ impl<'a> Iterator for Traverser<'a> {
     type Item = BlitzNode<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let node_id = self.parent.flat_children().get(self.child_index)?;
-        let node = self.parent.0.with(*node_id);
+        let flat = self.parent.flat_children();
+        let node_id = if let Some(id) = flat.get(self.child_index) {
+            *id
+        } else if self
+            .parent
+            .element_data()
+            .is_some_and(|el| el.shadow_root.is_some())
+        {
+            *self.parent.children.get(self.child_index - flat.len())?
+        } else {
+            return None;
+        };
+        let node = self.parent.0.with(node_id);
 
         self.child_index += 1;
 
