@@ -633,6 +633,9 @@ impl Node {
     }
 
     pub fn flat_parent(&self) -> Option<NodeId> {
+        if let NodeData::ShadowRoot { host, .. } = self.data {
+            return Some(host);
+        }
         let parent_id = self.parent?;
         if let NodeData::ShadowRoot { host, .. } = self.tree()[parent_id].data {
             return Some(host);

@@ -59,7 +59,15 @@ impl BaseDocument {
     /// without revisiting their DOM children. Damage inside an anonymous box
     /// also invalidates its cache by walking `layout_parent` upward.
     pub(crate) fn propagate_damage_flags(&mut self, node_id: NodeId) -> RestyleDamage {
-        let own_damage = if let Some(data) = self.nodes[node_id]
+        // A shadow root has no stylo element data of its own, but its children
+        // are layout children of the host (<https://dom.spec.whatwg.org/#concept-shadow-root>).
+        let is_shadow_root = matches!(
+            self.nodes[node_id].data,
+            crate::node::NodeData::ShadowRoot { .. }
+        );
+        let own_damage = if is_shadow_root {
+            RestyleDamage::empty()
+        } else if let Some(data) = self.nodes[node_id]
             .try_stylo_element_data_mut()
             .and_then(|s| s.get_mut())
         {
@@ -73,9 +81,16 @@ impl BaseDocument {
         // skipped themselves because damage marking walks the DOM parent
         // chain, which bypasses anonymous boxes: a damaged node's flagged
         // ancestors may reach it only through an unflagged anonymous wrapper.
+        // Shadow roots are not skipped either: damage marking propagates from
+        // their children straight to the host (`flat_parent`), so the root has
+        // no flag of its own to signal that its subtree needs visiting.
         {
             let node = &self.nodes[node_id];
-            if damage.is_empty() && !node.has_damaged_descendants() && !node.is_anonymous() {
+            if damage.is_empty()
+                && !node.has_damaged_descendants()
+                && !node.is_anonymous()
+                && !is_shadow_root
+            {
                 return RestyleDamage::empty();
             }
         }
@@ -85,11 +100,25 @@ impl BaseDocument {
         for child in children.iter() {
             damage_from_children |= self.propagate_damage_flags(*child);
         }
+        let shadow_root = self.nodes[node_id]
+            .element_data()
+            .and_then(|element| element.shadow_root);
+        if let Some(shadow_root) = shadow_root {
+            damage_from_children |= self.propagate_damage_flags(shadow_root);
+        }
         if let Some(before_id) = self.nodes[node_id].before() {
             damage_from_children |= self.propagate_damage_flags(before_id);
         }
         if let Some(after_id) = self.nodes[node_id].after() {
             damage_from_children |= self.propagate_damage_flags(after_id);
+        }
+
+        // A shadow root has no box of its own; its children's damage reaches
+        // the host through `CONSTRUCT_BOX`, which the host consumes when it
+        // rebuilds its flat children.
+        if is_shadow_root {
+            self.nodes[node_id].children = children;
+            return damage_from_children;
         }
 
         // A child's `order` changed: this container re-collects (and so re-sorts)
@@ -315,13 +344,15 @@ impl BaseDocument {
             return;
         };
         let is_anonymous = node.is_anonymous();
+        let is_shadow_root = matches!(node.data, crate::node::NodeData::ShadowRoot { .. });
         let has_damage = node.damage().is_some_and(|d| !d.is_empty());
-        if !has_damage && !node.has_damaged_descendants() && !is_anonymous {
+        if !has_damage && !node.has_damaged_descendants() && !is_anonymous && !is_shadow_root {
             return;
         }
         let anonymous_blocks = std::mem::take(&mut node.anonymous_blocks);
         let children = std::mem::take(&mut node.children);
         let (before, after) = (node.before(), node.after());
+        let shadow_root = node.element_data().and_then(|element| element.shadow_root);
 
         for anon_id in anonymous_blocks.iter() {
             self.clear_damage_and_dirty_flags(*anon_id);
@@ -330,6 +361,9 @@ impl BaseDocument {
             for child in children.iter() {
                 self.clear_damage_and_dirty_flags(*child);
             }
+        }
+        if let Some(shadow_root) = shadow_root {
+            self.clear_damage_and_dirty_flags(shadow_root);
         }
         if let Some(before_id) = before {
             self.clear_damage_and_dirty_flags(before_id);

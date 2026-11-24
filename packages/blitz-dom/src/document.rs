@@ -5645,4 +5645,60 @@ mod cascade_position_tests {
             Some("Alpha Beta")
         );
     }
+
+    #[test]
+    fn shadow_root_attached_after_layout_relays_out() {
+        let mut doc = document();
+        let root = doc.root_node().id;
+        let host = {
+            let mut mutator = doc.mutate();
+            let html = mutator.create_element(
+                qual_name!("html"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block;".into(),
+                }],
+            );
+            let body = mutator.create_element(
+                qual_name!("body"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block; margin: 0;".into(),
+                }],
+            );
+            let host = mutator.create_element(
+                qual_name!("div"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block; width: 100px; height: 100px;".into(),
+                }],
+            );
+            mutator.append_children(body, &[host]);
+            mutator.append_children(html, &[body]);
+            mutator.append_children(root, &[html]);
+            host
+        };
+        doc.resolve(0.0);
+        let shadow_child = {
+            let mut mutator = doc.mutate();
+            let shadow = mutator.attach_shadow_root(host, false);
+            let shadow_child = mutator.create_element(
+                qual_name!("p"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block; width: 100px; height: 100px;".into(),
+                }],
+            );
+            mutator.append_children(shadow, &[shadow_child]);
+            shadow_child
+        };
+        doc.resolve(0.0);
+        assert!(
+            doc.nodes[shadow_child].primary_styles().is_some(),
+            "a shadow child appended after layout must be styled"
+        );
+        let layout = doc.nodes[shadow_child].final_layout();
+        assert_eq!(layout.size.width, 100.0);
+        assert_eq!(layout.size.height, 100.0);
+    }
 }
