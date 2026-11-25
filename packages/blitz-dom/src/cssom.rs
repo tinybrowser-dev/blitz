@@ -682,6 +682,7 @@ impl BaseDocument {
             let mut guard = self.guard.write();
             *sheet.0.contents.write_with(&mut guard) = contents;
         }
+        self.font_face_states.remove(&sheet_id);
         if let Some(record) = self.cssom_sheets.get_mut(&sheet_id) {
             record.origin_clean = true;
         }

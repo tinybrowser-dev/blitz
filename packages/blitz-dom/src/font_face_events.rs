@@ -41,11 +41,63 @@ pub enum FontFaceLoadStatus {
     Error,
 }
 
+/// The current load state of a CSS-connected `@font-face` rule
+/// (<https://drafts.csswg.org/css-font-loading/#enumdef-fontfaceloadstatus>).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontFaceRuleStatus {
+    Unloaded,
+    Loading,
+    Loaded,
+    Error,
+}
+
 impl crate::document::BaseDocument {
     /// Take the `@font-face` rules whose source list settled and empty the
     /// list. A rule is reported once, at the transition that settled it
     /// (<https://drafts.csswg.org/css-font-loading/#dom-fontface-status>).
     pub fn take_pending_font_face_events(&mut self) -> Vec<PendingFontFaceEvent> {
         std::mem::take(&mut self.pending_font_face_events)
+    }
+
+    /// Return the current load status of the `@font-face` rule at `(sheet, path)`
+    /// (<https://drafts.csswg.org/css-font-loading/#dom-fontface-status>).
+    pub fn font_face_status(&self, sheet: u64, path: &[usize]) -> FontFaceRuleStatus {
+        self.font_face_states
+            .get(&sheet)
+            .and_then(|rules| rules.get(path))
+            .copied()
+            .unwrap_or(FontFaceRuleStatus::Unloaded)
+    }
+
+    pub(crate) fn set_font_face_loading(&mut self, sheet: u64, path: &[usize]) {
+        self.font_face_states
+            .entry(sheet)
+            .or_default()
+            .insert(path.to_vec(), FontFaceRuleStatus::Loading);
+    }
+
+    pub(crate) fn record_font_face_settled(
+        &mut self,
+        rule: ServoArc<Locked<FontFaceRule>>,
+        status: FontFaceLoadStatus,
+        url: Option<String>,
+        sheet: u64,
+        path: Vec<usize>,
+    ) {
+        let rule_status = match status {
+            FontFaceLoadStatus::Loaded => FontFaceRuleStatus::Loaded,
+            FontFaceLoadStatus::Error => FontFaceRuleStatus::Error,
+        };
+        self.font_face_states
+            .entry(sheet)
+            .or_default()
+            .insert(path.clone(), rule_status);
+        self.pending_font_face_events.push(PendingFontFaceEvent {
+            rule,
+            status,
+            url,
+            sheet,
+            path,
+        });
     }
 }

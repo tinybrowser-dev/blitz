@@ -327,6 +327,12 @@ pub struct BaseDocument {
     /// resolve `document.fonts.ready`
     /// (<https://drafts.csswg.org/css-font-loading/#dom-fontface-status>).
     pub(crate) pending_font_face_events: Vec<crate::font_face_events::PendingFontFaceEvent>,
+    /// Current CSS Font Loading status for each `@font-face` rule this document
+    /// has started loading, keyed by CSSOM `(sheet, path)` so realms created
+    /// after settlement observe the same state
+    /// (<https://drafts.csswg.org/css-font-loading/#dom-fontface-status>).
+    pub(crate) font_face_states:
+        HashMap<u64, HashMap<Vec<usize>, crate::font_face_events::FontFaceRuleStatus>>,
     /// The document's animation timeline in milliseconds, sampled at the start
     /// of every [`BaseDocument::resolve`] from the embedder's clock. A smooth
     /// scroll advances on it, so it follows the same clock as frames and timers
@@ -828,6 +834,7 @@ impl BaseDocument {
             pending_scrollends: Vec::new(),
             pending_animation_events: Vec::new(),
             pending_font_face_events: Vec::new(),
+            font_face_states: HashMap::new(),
             animation_time_ms: 0.0,
             text_selection: TextSelection::default(),
             scratch: DocumentScratch::default(),
@@ -2202,16 +2209,16 @@ impl BaseDocument {
                 // source: the rule settles as an error, rather than leaving a
                 // face the embedder creates from it waiting forever
                 // (<https://drafts.csswg.org/css-fonts-4/#font-family-desc>).
-                self.pending_font_face_events
-                    .push(crate::font_face_events::PendingFontFaceEvent {
-                        rule: key.rule.clone(),
-                        status: crate::font_face_events::FontFaceLoadStatus::Error,
-                        url: None,
-                        sheet: key.cssom_sheet,
-                        path: key.cssom_path.clone(),
-                    });
+                self.record_font_face_settled(
+                    key.rule,
+                    crate::font_face_events::FontFaceLoadStatus::Error,
+                    None,
+                    key.cssom_sheet,
+                    key.cssom_path,
+                );
                 return;
             };
+            self.set_font_face_loading(key.cssom_sheet, &key.cssom_path);
             crate::net::fetch_font_face_source(
                 crate::net::FontFaceLoadKey {
                     source_index: index,
@@ -2229,14 +2236,13 @@ impl BaseDocument {
             );
             return;
         }
-        self.pending_font_face_events
-            .push(crate::font_face_events::PendingFontFaceEvent {
-                rule: key.rule.clone(),
-                status: crate::font_face_events::FontFaceLoadStatus::Error,
-                url: None,
-                sheet: key.cssom_sheet,
-                path: key.cssom_path.clone(),
-            });
+        self.record_font_face_settled(
+            key.rule,
+            crate::font_face_events::FontFaceLoadStatus::Error,
+            None,
+            key.cssom_sheet,
+            key.cssom_path,
+        );
     }
 
     pub fn load_resource(&mut self, res: ResourceLoadResponse) {
@@ -2429,14 +2435,12 @@ impl BaseDocument {
                     return;
                 }
                 if let Some(key) = res.font_face {
-                    self.pending_font_face_events.push(
-                        crate::font_face_events::PendingFontFaceEvent {
-                            rule: key.rule.clone(),
-                            status: crate::font_face_events::FontFaceLoadStatus::Loaded,
-                            url: res.resolved_url,
-                            sheet: key.cssom_sheet,
-                            path: key.cssom_path,
-                        },
+                    self.record_font_face_settled(
+                        key.rule,
+                        crate::font_face_events::FontFaceLoadStatus::Loaded,
+                        res.resolved_url,
+                        key.cssom_sheet,
+                        key.cssom_path,
                     );
                 }
 
@@ -5221,6 +5225,59 @@ mod font_face_source_loop_tests {
         assert_eq!(events.len(), 1, "the advance settles the rule once");
         assert_eq!(events[0].status, FontFaceLoadStatus::Error);
         assert!(ServoArc::ptr_eq(&events[0].rule, &rule));
+    }
+
+    #[test]
+    fn font_face_status_tracks_loading_and_persists_after_drain() {
+        use crate::font_face_events::FontFaceRuleStatus;
+
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        assert_eq!(
+            document.font_face_status(7, &[0]),
+            FontFaceRuleStatus::Unloaded
+        );
+
+        let rule = font_face_rule(
+            &document,
+            "@font-face { font-family: TestFace; src: url(https://example.test/font.ttf) }",
+        );
+        let key = FontFaceLoadKey {
+            rule: rule.clone(),
+            sheet_url: None,
+            source_index: 0,
+            cssom_sheet: 7,
+            cssom_path: vec![0],
+        };
+        document.load_font_face_sources(key.clone(), None);
+        assert_eq!(
+            document.font_face_status(7, &[0]),
+            FontFaceRuleStatus::Loading
+        );
+
+        document.load_resource(ResourceLoadResponse {
+            request_id: 0,
+            node_id: None,
+            resolved_url: Some(String::from("https://example.test/font.ttf")),
+            image_key: None,
+            origin_clean: false,
+            font_face: Some(key),
+            result: Ok(Resource::Font(
+                blitz_traits::net::Bytes::from_static(crate::BULLET_FONT),
+                crate::net::FontFaceOverrides {
+                    family_name: Some(String::from("TestFace")),
+                    weight: None,
+                    style: None,
+                    width: None,
+                },
+            )),
+        });
+        let events = document.take_pending_font_face_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, FontFaceLoadStatus::Loaded);
+        assert_eq!(
+            document.font_face_status(7, &[0]),
+            FontFaceRuleStatus::Loaded
+        );
     }
 }
 
