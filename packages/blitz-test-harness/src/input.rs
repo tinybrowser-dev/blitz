@@ -7,8 +7,8 @@
 use blitz_dom::Document;
 use blitz_traits::events::{
     BlitzImeEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta,
-    BlitzWheelEvent, KeyState, MouseEventButton, MouseEventButtons, Point, PointerCoords,
-    PointerDetails, UiEvent,
+    BlitzWheelEvent, BlitzWheelPhase, BlitzWheelSource, KeyState, MouseEventButton,
+    MouseEventButtons, Point, PointerCoords, PointerDetails, UiEvent,
 };
 use keyboard_types::{Code, Key, Location, Modifiers};
 use smol_str::SmolStr;
@@ -60,10 +60,10 @@ pub fn mouse_pointer_event(x: f32, y: f32) -> BlitzPointerEvent {
     )
 }
 
-/// Construct a finger [`BlitzPointerEvent`] at page coordinates `(x, y)`
-pub fn touch_pointer_event(finger: u64, x: f32, y: f32) -> BlitzPointerEvent {
+/// Construct a [`BlitzPointerEvent`] for a zero-based finger index at page coordinates `(x, y)`
+pub fn touch_pointer_event(finger_index: u64, x: f32, y: f32) -> BlitzPointerEvent {
     pointer_event(
-        BlitzPointerId::Finger(finger),
+        BlitzPointerId::finger(finger_index),
         x,
         y,
         MouseEventButton::Main,
@@ -185,9 +185,32 @@ impl<D: Document> Harness<D> {
     /// Negative `delta_y` scrolls the content down (like rolling the wheel towards you).
     /// The mouse is first moved to `(x, y)` so the wheel targets the hovered element.
     pub fn wheel_at(&mut self, x: f32, y: f32, delta_x: f64, delta_y: f64) {
+        self.wheel_gesture_at(
+            x,
+            y,
+            delta_x,
+            delta_y,
+            BlitzWheelPhase::Moved,
+            BlitzWheelSource::Unknown,
+        );
+    }
+
+    /// [`Harness::wheel_at`], as part of a trackpad gesture: `phase` and `source` place the
+    /// event in the gesture.
+    pub fn wheel_gesture_at(
+        &mut self,
+        x: f32,
+        y: f32,
+        delta_x: f64,
+        delta_y: f64,
+        phase: BlitzWheelPhase,
+        source: BlitzWheelSource,
+    ) {
         self.move_mouse_to(x, y);
         let event = BlitzWheelEvent {
             delta: BlitzWheelDelta::Pixels(delta_x, delta_y),
+            phase,
+            source,
             coords: coords(x, y),
             buttons: MouseEventButtons::empty(),
             mods: Modifiers::default(),

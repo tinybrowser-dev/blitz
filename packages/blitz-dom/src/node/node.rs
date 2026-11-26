@@ -138,7 +138,7 @@ pub struct Node {
     /// For element nodes this holds the [`ElementData`], which stores most of
     /// the per-node style/layout state. For the document node it holds the
     /// [`DocumentData`]. Access the moved fields through the forwarding methods
-    /// on [`Node`] (e.g. [`Node::style`], [`Node::final_layout`]).
+    /// on [`Node`] (e.g. [`Node::primary_styles`], [`Node::final_layout`]).
     pub data: NodeData,
 }
 
@@ -503,6 +503,14 @@ impl Node {
     }
 
     pub fn is_or_contains_block(&self) -> bool {
+        let display = self.display_style().unwrap_or(StyloDisplay::inline());
+
+        // display: contents generates no box (so its own position and float don't apply):
+        // its children participate in the parent's formatting context in its place
+        if display.inside() == DisplayInside::Contents {
+            return self.any_child_is_or_contains_block();
+        }
+
         let style = self.primary_styles();
         let style = style.as_ref();
 
@@ -525,21 +533,17 @@ impl Node {
         if is_floating {
             return false;
         }
-        let display = self.display_style().unwrap_or(StyloDisplay::inline());
         match display.outside() {
             DisplayOutside::None => false,
             DisplayOutside::Block => true,
-            _ => {
-                if display.inside() == DisplayInside::Flow {
-                    self.children
-                        .iter()
-                        .copied()
-                        .any(|child_id| self.tree()[child_id].is_or_contains_block())
-                } else {
-                    false
-                }
-            }
+            _ => display.inside() == DisplayInside::Flow && self.any_child_is_or_contains_block(),
         }
+    }
+
+    fn any_child_is_or_contains_block(&self) -> bool {
+        self.children
+            .iter()
+            .any(|&child_id| self.tree()[child_id].is_or_contains_block())
     }
 
     /// Whether box-tree construction found this to be an inline box with block-level in-flow content only.
@@ -2021,8 +2025,8 @@ impl Node {
                 .is_some_and(|styles| styles.get_box().position == Position::Static)
     }
 
-    /// The nearest layout ancestor that [is an offset parent](Self::is_offset_parent), as in
-    /// CSSOM View's `offsetParent`.
+    /// The nearest layout ancestor that is an offset parent, as in CSSOM View's
+    /// `offsetParent`.
     pub fn offset_parent(&self) -> Option<&Node> {
         let mut node = self;
         let static_element = self.is_statically_positioned();
@@ -2341,6 +2345,34 @@ impl Node {
         let grid = *table.grid_layout.borrow();
         let size = *table.wrapper_size.borrow();
         Some((grid?.location, size?))
+    }
+
+    /// Whether the node is a scroll container: its `overflow` is not `visible` or `clip` on
+    /// at least one axis.
+    pub fn is_scroll_container(&self) -> bool {
+        self.primary_styles().is_some_and(|styles| {
+            let box_style = styles.get_box();
+            box_style.overflow_x.is_scrollable() || box_style.overflow_y.is_scrollable()
+        })
+    }
+
+    /// Whether the node's `overscroll-behavior` stops scroll chaining on each axis.
+    /// `contain` and `none` both do, as Blitz draws no overscroll effect.
+    pub(crate) fn contains_overscroll(&self) -> crate::Point<bool> {
+        use style::values::computed::OverscrollBehavior;
+        let contains = |behavior| {
+            matches!(
+                behavior,
+                OverscrollBehavior::Contain | OverscrollBehavior::None
+            )
+        };
+        match self.primary_styles() {
+            Some(styles) => crate::Point {
+                x: contains(styles.get_box().overscroll_behavior_x),
+                y: contains(styles.get_box().overscroll_behavior_y),
+            },
+            None => crate::Point { x: false, y: false },
+        }
     }
 
     /// Does the node generate any boxes? (e.g. `getClientRects()` returns an empty

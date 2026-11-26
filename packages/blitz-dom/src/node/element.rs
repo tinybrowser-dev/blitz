@@ -1165,9 +1165,12 @@ impl ElementData {
         url_extra_data: &UrlExtraData,
         quirks_mode: QuirksMode,
     ) {
-        self.style_attribute = self.attr(local_name!("style")).map(|style_str| {
+        let style = self.attrs.iter().find(|attr| {
+            attr.name.ns == markup5ever::ns!() && attr.name.local == local_name!("style")
+        });
+        self.style_attribute = style.map(|attr| {
             ServoArc::new(guard.wrap(parse_style_attribute(
-                style_str,
+                &attr.value,
                 url_extra_data,
                 None,
                 quirks_mode,

@@ -333,17 +333,9 @@ impl DocumentMutator<'_> {
         let is_template = data.name.ns == markup5ever::ns!(html)
             && data.name.local == markup5ever::local_name!("template");
 
+        // Stylo data is created by the style traversal (`ensure_data`): Stylo treats an
+        // element having data as it having been styled.
         let id = self.doc.create_node(NodeData::Element(Box::new(data)));
-        let node = self
-            .doc
-            .get_node_mut(id)
-            .expect("freshly created node exists");
-
-        // Initialise style data
-        *node.stylo_element_data_mut().ensure_init_mut() = style::data::ElementData {
-            damage: ALL_DAMAGE,
-            ..Default::default()
-        };
 
         if is_template {
             self.template_contents(id);
@@ -667,7 +659,7 @@ impl DocumentMutator<'_> {
             element.store_selectedness(true, Dirtiness::Keep);
         }
 
-        if *attr == local_name!("style") {
+        if name.ns == ns!() && *attr == local_name!("style") {
             element.flush_style_attribute(&self.doc.guard, &self.doc.url.url_extra_data(), quirks);
             node.set_restyle_hint(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
             return;
@@ -895,7 +887,7 @@ impl DocumentMutator<'_> {
             return;
         }
 
-        if *attr == local_name!("style") {
+        if name.ns == ns!() && *attr == local_name!("style") {
             element.flush_style_attribute(&self.doc.guard, &self.doc.url.url_extra_data(), quirks);
             node.set_restyle_hint(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
         } else if (tag, attr) == tag_and_attr!("input", "checked") {
@@ -1809,6 +1801,7 @@ impl<'doc> DocumentMutator<'doc> {
 
     fn process_removed_subtree(&mut self, node_id: NodeId) {
         self.doc.iter_subtree_mut(node_id, |node_id, doc| {
+            doc.reset_node_scroll_state(node_id);
             doc.nodes[node_id]
                 .flags
                 .set(NodeFlags::IS_IN_DOCUMENT, false);
