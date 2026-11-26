@@ -6,9 +6,7 @@ use std::sync::atomic::Ordering;
 use crate::layout::damage::compute_layout_damage;
 use crate::node::Node;
 use crate::node::NodeData;
-use markup5ever::{
-    LocalName, LocalNameStaticSet, Namespace, NamespaceStaticSet, local_name, ns,
-};
+use markup5ever::{LocalName, LocalNameStaticSet, Namespace, NamespaceStaticSet, local_name, ns};
 use selectors::bloom::BLOOM_HASH_MASK;
 use selectors::{
     OpaqueElement,
@@ -260,9 +258,8 @@ impl selectors::Element for BlitzNode<'_> {
         // The mode is stamped on each element so a detached element still
         // knows it
         // (<https://drafts.csswg.org/selectors-4/#attribute-case>).
-        self.element_data().is_some_and(|element| {
-            element.name.ns == ns!(html) && element.in_html_document
-        })
+        self.element_data()
+            .is_some_and(|element| element.name.ns == ns!(html) && element.in_html_document)
     }
 
     fn has_local_name(&self, local_name: &LocalName) -> bool {
@@ -338,9 +335,7 @@ impl selectors::Element for BlitzNode<'_> {
                 .contains(ElementState::PLACEHOLDER_SHOWN),
             // The bits are maintained by `ElementData::sync_form_selector_state`
             // <https://html.spec.whatwg.org/multipage/semantics-other.html#selector-read-write>
-            NonTSPseudoClass::ReadWrite => {
-                self.element_state().contains(ElementState::READWRITE)
-            }
+            NonTSPseudoClass::ReadWrite => self.element_state().contains(ElementState::READWRITE),
             NonTSPseudoClass::ReadOnly => self.element_state().contains(ElementState::READONLY),
             NonTSPseudoClass::ServoNonZeroBorder => false,
             // The document sets the bit on the element its URL fragment names
@@ -664,7 +659,9 @@ impl<'a> TElement for BlitzNode<'a> {
     }
 
     fn mutate_data(&self) -> Option<ElementDataMut<'_>> {
-        unsafe { self.stylo_element_data().unsafe_stylo_only_mut() }
+        self.try_stylo_element_data()
+            .and_then(|s| unsafe { s.unsafe_stylo_only_mut() })
+            .filter(|data| data.styles.primary.is_some())
     }
 
     fn skip_item_display_fixup(&self) -> bool {
@@ -777,9 +774,9 @@ impl<'a> TElement for BlitzNode<'a> {
             .iter()
             .find(|attr| attr.name.local == local_name!("lang") && attr.name.ns == ns!(xml))
             .or_else(|| {
-                attrs.iter().find(|attr| {
-                    attr.name.local == local_name!("lang") && attr.name.ns.is_empty()
-                })
+                attrs
+                    .iter()
+                    .find(|attr| attr.name.local == local_name!("lang") && attr.name.ns.is_empty())
             })
             .map(|attr| style::selector_parser::AttrValue::from(attr.value.as_str()))
     }

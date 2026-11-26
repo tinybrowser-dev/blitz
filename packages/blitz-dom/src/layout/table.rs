@@ -26,9 +26,13 @@ use taffy::{
     compute_block_layout, style_helpers,
 };
 
+use thin_vec::ThinVec;
+
 use crate::layout::LayoutPassState;
+use crate::node::NodeData;
 use crate::{BaseDocument, taffy_node_id};
 
+use super::construct::create_anonymous_block_node;
 use super::damage::{CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC};
 use super::resolve_calc_value;
 
@@ -149,7 +153,7 @@ pub struct TableColumn {
 #[derive(Debug, Clone)]
 pub struct TableRow {
     // kind: TableItemKind,
-    pub node_id: NodeId,
+    pub node_id: Option<NodeId>,
     /// The row group (if any) that contains the row
     pub group: Option<NodeId>,
     /// The row's specified `height`, if it is a length
@@ -228,6 +232,7 @@ fn percent_plus_length(
 pub(crate) fn build_table_context(
     doc: &mut BaseDocument,
     table_root_node_id: NodeId,
+    anonymous_blocks: &mut ThinVec<NodeId>,
 ) -> (TableContext, Vec<NodeId>) {
     let mut cells: Vec<TableCell> = Vec::new();
     let mut oof_children: Vec<(NodeId, taffy::Position)> = Vec::new();
@@ -320,29 +325,34 @@ pub(crate) fn build_table_context(
             _ => 1,
         }
     };
-    for order in 0..3 {
-        for child_id in children.iter().copied() {
-            if captions.iter().any(|caption| caption.node_id == child_id) {
-                continue;
+    {
+        let mut collector = TableCollector {
+            doc,
+            table_root_node_id,
+            wm,
+            is_fixed,
+            border_collapse,
+            row: &mut row,
+            cursor: &mut cursor,
+            cells: &mut cells,
+            oof_children: &mut oof_children,
+            rows: &mut rows,
+            columns: &mut column_sizes,
+            first_cell_border: &mut first_cell_border,
+            percent_columns: &mut percent_columns,
+            anonymous_blocks,
+        };
+        for order in 0..3 {
+            let mut table_run = AnonymousRun::new(false);
+            for child_id in children.iter().copied() {
+                if captions.iter().any(|caption| caption.node_id == child_id) {
+                    continue;
+                }
+                if row_group_order(collector.doc, child_id) != order {
+                    continue;
+                }
+                collector.collect_child(table_root_node_id, child_id, &mut table_run);
             }
-            if row_group_order(doc, child_id) != order {
-                continue;
-            }
-            collect_table_cells(
-                doc,
-                child_id,
-                wm,
-                is_fixed,
-                border_collapse,
-                &mut row,
-                &mut cursor,
-                &mut cells,
-                &mut oof_children,
-                &mut rows,
-                &mut column_sizes,
-                &mut first_cell_border,
-                &mut percent_columns,
-            );
         }
     }
     let remaining_column = if is_fixed {
@@ -615,250 +625,354 @@ fn collect_columns(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_table_cells(
-    doc: &mut BaseDocument,
-    node_id: NodeId,
+// https://drafts.csswg.org/css-tables-3/#fixup
+struct AnonymousRun {
+    in_explicit_row: bool,
+    anon_row_open: bool,
+    anon_cell: Option<NodeId>,
+    pending_ws: Vec<NodeId>,
+}
+
+impl AnonymousRun {
+    fn new(in_explicit_row: bool) -> Self {
+        Self {
+            in_explicit_row,
+            anon_row_open: false,
+            anon_cell: None,
+            pending_ws: Vec::new(),
+        }
+    }
+
+    fn flush_cell(&mut self) {
+        self.anon_cell = None;
+        self.pending_ws.clear();
+    }
+
+    fn flush_row(&mut self) {
+        self.flush_cell();
+        self.anon_row_open = false;
+    }
+}
+
+struct TableCollector<'a> {
+    doc: &'a mut BaseDocument,
+    table_root_node_id: NodeId,
     wm: WritingMode,
     is_fixed: bool,
     border_collapse: BorderCollapse,
-    row: &mut u16,
-    cursor: &mut ColumnCursor,
-    cells: &mut Vec<TableCell>,
-    oof_children: &mut Vec<(NodeId, taffy::Position)>,
-    rows: &mut Vec<TableRow>,
-    columns: &mut Vec<TrackSizingFunction>,
-    first_cell_border: &mut Option<ServoArc<Border>>,
-    percent_columns: &mut Vec<(u16, f32, f32)>,
-) {
-    let node = &mut doc.nodes[node_id];
+    row: &'a mut u16,
+    cursor: &'a mut ColumnCursor,
+    cells: &'a mut Vec<TableCell>,
+    oof_children: &'a mut Vec<(NodeId, taffy::Position)>,
+    rows: &'a mut Vec<TableRow>,
+    columns: &'a mut Vec<TrackSizingFunction>,
+    first_cell_border: &'a mut Option<ServoArc<Border>>,
+    percent_columns: &'a mut Vec<(u16, f32, f32)>,
+    anonymous_blocks: &'a mut ThinVec<NodeId>,
+}
 
-    if !node.is_element() {
-        return;
+impl TableCollector<'_> {
+    fn ensure_row(&mut self, run: &mut AnonymousRun) {
+        if !run.in_explicit_row && !run.anon_row_open {
+            *self.row += 1;
+            self.cursor.start_row();
+            self.rows.push(TableRow {
+                node_id: None,
+                group: None,
+                height: None,
+                is_constrained: false,
+            });
+            run.anon_row_open = true;
+        }
     }
 
-    let Some(display) = node.display_style() else {
-        #[cfg(feature = "tracing")]
-        tracing::info!("Ignoring table descendent because it has no styles");
-        return;
-    };
+    fn push_improper_child(
+        &mut self,
+        style_parent_id: NodeId,
+        child_id: NodeId,
+        run: &mut AnonymousRun,
+    ) {
+        self.ensure_row(run);
+        let anon_id = match run.anon_cell {
+            Some(id) => id,
+            None => {
+                let anon_id =
+                    create_anonymous_block_node(self.doc, self.table_root_node_id, style_parent_id);
+                self.anonymous_blocks.push(anon_id);
 
-    if display.outside() == DisplayOutside::None {
-        node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-        return;
-    }
-
-    // Absolutely positioned boxes are out-of-flow: they are laid out by their containing
-    // block rather than as part of the table grid.
-    let position = node.primary_styles().unwrap().clone_position();
-    if position.is_absolutely_positioned() {
-        oof_children.push((node_id, stylo_taffy::convert::position(position)));
-        return;
-    }
-
-    match display.inside() {
-        DisplayInside::TableRowGroup
-        | DisplayInside::TableHeaderGroup
-        | DisplayInside::TableFooterGroup
-        | DisplayInside::Contents => {
-            let first_row = rows.len();
-            let children = std::mem::take(&mut doc.nodes[node_id].children);
-            for child_id in children.iter().copied() {
-                doc.nodes[child_id]
-                    .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                collect_table_cells(
-                    doc,
-                    child_id,
-                    wm,
-                    is_fixed,
-                    border_collapse,
-                    row,
-                    cursor,
-                    cells,
-                    oof_children,
-                    rows,
-                    columns,
-                    first_cell_border,
-                    percent_columns,
-                );
+                let col = self.cursor.next_free();
+                let mut style =
+                    table_taffy_style(&self.doc.nodes[anon_id].primary_styles().unwrap(), self.wm);
+                if self.border_collapse == BorderCollapse::Collapse {
+                    style.border = taffy::Rect::ZERO.map(style_helpers::length);
+                }
+                if self.is_fixed {
+                    style.min_size.width = style_helpers::length(0.0);
+                }
+                if *self.row == 1 && (col as usize) >= self.columns.len() {
+                    self.columns.resize(col as usize, style_helpers::auto());
+                    self.columns.push(style_helpers::auto());
+                }
+                style.margin = taffy::Rect::ZERO.map(style_helpers::length);
+                style.grid_column = taffy::Line {
+                    start: style_helpers::auto(),
+                    end: style_helpers::span(1),
+                };
+                style.grid_row = taffy::Line {
+                    start: style_helpers::line(*self.row as i16),
+                    end: style_helpers::span(1),
+                };
+                style.size.width = style_helpers::auto();
+                self.cells.push(TableCell {
+                    node_id: anon_id,
+                    row: self.row.saturating_sub(1),
+                    column: col,
+                    style,
+                });
+                self.cursor.place(1, 1);
+                run.anon_cell = Some(anon_id);
+                anon_id
             }
-            doc.nodes[node_id].children = children;
-            if display.inside() != DisplayInside::Contents {
-                for row in &mut rows[first_row..] {
+        };
+        let anon_children = &mut self.doc.nodes[anon_id].children;
+        anon_children.extend(run.pending_ws.drain(..));
+        anon_children.push(child_id);
+    }
+
+    fn collect_child(&mut self, style_parent_id: NodeId, node_id: NodeId, run: &mut AnonymousRun) {
+        match &self.doc.nodes[node_id].data {
+            NodeData::Comment { .. }
+            | NodeData::Doctype { .. }
+            | NodeData::ProcessingInstruction { .. }
+            | NodeData::Document(_)
+            | NodeData::Fragment { .. }
+            | NodeData::ShadowRoot { .. } => return,
+            NodeData::Text(text) => {
+                if text.content.chars().all(char::is_whitespace) {
+                    if run.anon_cell.is_some() {
+                        run.pending_ws.push(node_id);
+                    }
+                } else {
+                    self.push_improper_child(style_parent_id, node_id, run);
+                }
+                return;
+            }
+            NodeData::CDataSection { contents } => {
+                if contents.chars().all(char::is_whitespace) {
+                    if run.anon_cell.is_some() {
+                        run.pending_ws.push(node_id);
+                    }
+                } else {
+                    self.push_improper_child(style_parent_id, node_id, run);
+                }
+                return;
+            }
+            NodeData::Element(_) | NodeData::AnonymousBlock(_) => {}
+        }
+
+        let node = &mut self.doc.nodes[node_id];
+        let Some(display) = node.display_style() else {
+            #[cfg(feature = "tracing")]
+            tracing::info!("Ignoring table descendent because it has no styles");
+            return;
+        };
+
+        if display.outside() == DisplayOutside::None {
+            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+            return;
+        }
+
+        // Absolutely positioned boxes are out-of-flow: they are laid out by their containing
+        // block rather than as part of the table grid.
+        let position = node.primary_styles().unwrap().clone_position();
+        if position.is_absolutely_positioned() {
+            self.oof_children
+                .push((node_id, stylo_taffy::convert::position(position)));
+            return;
+        }
+
+        match display.inside() {
+            DisplayInside::Contents => {
+                node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                let children = std::mem::take(&mut self.doc.nodes[node_id].children);
+                for child_id in children.iter().copied() {
+                    self.collect_child(node_id, child_id, run);
+                }
+                self.doc.nodes[node_id].children = children;
+            }
+            DisplayInside::TableRowGroup
+            | DisplayInside::TableHeaderGroup
+            | DisplayInside::TableFooterGroup => {
+                run.flush_row();
+                node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                let first_row = self.rows.len();
+                let children = std::mem::take(&mut self.doc.nodes[node_id].children);
+                let mut group_run = AnonymousRun::new(false);
+                for child_id in children.iter().copied() {
+                    self.collect_child(node_id, child_id, &mut group_run);
+                }
+                self.doc.nodes[node_id].children = children;
+                for row in &mut self.rows[first_row..] {
                     row.group.get_or_insert(node_id);
                 }
             }
-        }
-        DisplayInside::TableRow => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            *row += 1;
-            cursor.start_row();
+            DisplayInside::TableRow => {
+                run.flush_row();
+                node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                *self.row += 1;
+                self.cursor.start_row();
 
-            let height = node.primary_styles().and_then(|style| {
-                let height = stylo_taffy::convert::dimension(style.get_height());
-                (height.tag() == taffy::CompactLength::LENGTH_TAG).then(|| height.value())
-            });
-            rows.push(TableRow {
-                node_id,
-                group: None,
-                height,
-                is_constrained: height.is_some(),
-            });
+                let height = node.primary_styles().and_then(|style| {
+                    let height = stylo_taffy::convert::dimension(style.get_height());
+                    (height.tag() == taffy::CompactLength::LENGTH_TAG).then(|| height.value())
+                });
+                self.rows.push(TableRow {
+                    node_id: Some(node_id),
+                    group: None,
+                    height,
+                    is_constrained: height.is_some(),
+                });
 
-            let children = std::mem::take(&mut doc.nodes[node_id].children);
-            for child_id in children.iter().copied() {
-                collect_table_cells(
-                    doc,
-                    child_id,
-                    wm,
-                    is_fixed,
-                    border_collapse,
-                    row,
-                    cursor,
-                    cells,
-                    oof_children,
-                    rows,
-                    columns,
-                    first_cell_border,
-                    percent_columns,
-                );
+                let children = std::mem::take(&mut self.doc.nodes[node_id].children);
+                let mut row_run = AnonymousRun::new(true);
+                for child_id in children.iter().copied() {
+                    self.collect_child(node_id, child_id, &mut row_run);
+                }
+                self.doc.nodes[node_id].children = children;
             }
-            doc.nodes[node_id].children = children;
-        }
-        DisplayInside::TableCell => {
-            // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            let stylo_style = &node.primary_styles().unwrap();
-            let colspan: u16 = node
-                .attr(local_name!("colspan"))
-                .and_then(|val| val.parse().ok())
-                .unwrap_or(1);
-            let rowspan: u16 = node
-                .attr(local_name!("rowspan"))
-                .and_then(|val| val.parse::<u16>().ok())
-                .map(|v| v.clamp(1, 65534))
-                .unwrap_or(1);
-            let mut style = table_taffy_style(stylo_style, wm);
-            let col = cursor.next_free();
+            DisplayInside::TableCell => {
+                run.flush_cell();
+                self.ensure_row(run);
+                let node = &self.doc.nodes[node_id];
+                let stylo_style = &node.primary_styles().unwrap();
+                let colspan: u16 = node
+                    .attr(local_name!("colspan"))
+                    .and_then(|val| val.parse().ok())
+                    .unwrap_or(1);
+                let rowspan: u16 = node
+                    .attr(local_name!("rowspan"))
+                    .and_then(|val| val.parse::<u16>().ok())
+                    .map(|v| v.clamp(1, 65534))
+                    .unwrap_or(1);
+                let mut style = table_taffy_style(stylo_style, self.wm);
+                let col = self.cursor.next_free();
 
-            // In the collapsed borders model the borders are laid out as gutters between
-            // the cells (see the table's `gap`) rather than as part of the cells
-            if border_collapse == BorderCollapse::Collapse {
-                style.border = taffy::Rect::ZERO.map(style_helpers::length);
-            }
+                // In the collapsed borders model the borders are laid out as gutters between
+                // the cells (see the table's `gap`) rather than as part of the cells
+                if self.border_collapse == BorderCollapse::Collapse {
+                    style.border = taffy::Rect::ZERO.map(style_helpers::length);
+                }
 
-            if first_cell_border.is_none() {
-                *first_cell_border = Some(stylo_style.clone_border());
-            }
+                if self.first_cell_border.is_none() {
+                    *self.first_cell_border = Some(stylo_style.clone_border());
+                }
 
-            // In the fixed table layout algorithm the widths of columns are not
-            // affected by cell contents, so cells must not impose a min-content
-            // floor on their tracks.
-            if is_fixed {
-                style.min_size.width = style_helpers::length(0.0);
-            }
+                // In the fixed table layout algorithm the widths of columns are not
+                // affected by cell contents, so cells must not impose a min-content
+                // floor on their tracks.
+                if self.is_fixed {
+                    style.min_size.width = style_helpers::length(0.0);
+                }
 
-            // Column widths from `<col>` elements take precedence over cell widths
-            let col_needs_width =
-                (col as usize) >= columns.len() || columns[col as usize].max.is_auto();
-            if *row == 1 && col_needs_width {
-                let column: TrackSizingFunction = match style.size.width.tag() {
-                    taffy::CompactLength::LENGTH_TAG => {
-                        let len = style.size.width.value();
-                        let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
-                        let border = style.border.resolve_or_zero(None, resolve_calc_value);
-                        match style.box_sizing {
-                            taffy::BoxSizing::ContentBox => style_helpers::length(
-                                len + padding.left + padding.right + border.left + border.right,
-                            ),
-                            taffy::BoxSizing::BorderBox => style_helpers::length(len),
+                // Column widths from `<col>` elements take precedence over cell widths
+                let col_needs_width = (col as usize) >= self.columns.len()
+                    || self.columns[col as usize].max.is_auto();
+                if *self.row == 1 && col_needs_width {
+                    let column: TrackSizingFunction = match style.size.width.tag() {
+                        taffy::CompactLength::LENGTH_TAG => {
+                            let len = style.size.width.value();
+                            let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
+                            let border = style.border.resolve_or_zero(None, resolve_calc_value);
+                            match style.box_sizing {
+                                taffy::BoxSizing::ContentBox => style_helpers::length(
+                                    len + padding.left + padding.right + border.left + border.right,
+                                ),
+                                taffy::BoxSizing::BorderBox => style_helpers::length(len),
+                            }
                         }
-                    }
-                    taffy::CompactLength::PERCENT_TAG => {
-                        if is_fixed {
-                            let extra = match style.box_sizing {
-                                taffy::BoxSizing::ContentBox => {
-                                    let padding =
-                                        style.padding.resolve_or_zero(None, resolve_calc_value);
-                                    let border =
-                                        style.border.resolve_or_zero(None, resolve_calc_value);
-                                    padding.left + padding.right + border.left + border.right
-                                }
-                                taffy::BoxSizing::BorderBox => 0.0,
-                            };
-                            // Resolved in `build_table_context` once the column count is known
-                            percent_columns.push((col, style.size.width.value(), extra));
-                            style_helpers::percent(style.size.width.value())
-                        } else {
-                            style_helpers::auto()
+                        taffy::CompactLength::PERCENT_TAG => {
+                            if self.is_fixed {
+                                let extra = match style.box_sizing {
+                                    taffy::BoxSizing::ContentBox => {
+                                        let padding =
+                                            style.padding.resolve_or_zero(None, resolve_calc_value);
+                                        let border =
+                                            style.border.resolve_or_zero(None, resolve_calc_value);
+                                        padding.left + padding.right + border.left + border.right
+                                    }
+                                    taffy::BoxSizing::BorderBox => 0.0,
+                                };
+                                // Resolved in `build_table_context` once the column count is known
+                                self.percent_columns
+                                    .push((col, style.size.width.value(), extra));
+                                style_helpers::percent(style.size.width.value())
+                            } else {
+                                style_helpers::auto()
+                            }
                         }
+                        taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
+                        // Dimension values are always length, percentage, auto or calc(),
+                        // so any other tag is a calc() value. Pass it through so that
+                        // Taffy resolves it against the table's inner width.
+                        _ => style.size.width.into(),
+                    };
+                    if (col as usize) < self.columns.len() {
+                        if !column.max.is_auto() {
+                            self.columns[col as usize] = column;
+                        }
+                    } else {
+                        self.columns.resize(col as usize, style_helpers::auto());
+                        self.columns.push(column);
                     }
-                    taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
-                    // Dimension values are always length, percentage, auto or calc(),
-                    // so any other tag is a calc() value. Pass it through so that
-                    // Taffy resolves it against the table's inner width.
-                    _ => style.size.width.into(),
+                }
+
+                // The margin properties do not apply to table-internal elements
+                style.margin = taffy::Rect::ZERO.map(style_helpers::length);
+
+                // Let Taffy auto-place the column. Combined with
+                // `grid_auto_flow: RowDense` set on the table root, each cell
+                // scans from the first track in its row for a free position,
+                // which makes cells automatically skip columns occupied by
+                // rowspan cells from earlier rows.
+                style.grid_column = taffy::Line {
+                    start: style_helpers::auto(),
+                    end: style_helpers::span(colspan),
                 };
-                if (col as usize) < columns.len() {
-                    if !column.max.is_auto() {
-                        columns[col as usize] = column;
+                style.grid_row = taffy::Line {
+                    start: style_helpers::line(*self.row as i16),
+                    end: style_helpers::span(rowspan),
+                };
+                if rowspan == 1 && style.size.height.tag() == taffy::CompactLength::LENGTH_TAG {
+                    if let Some(row) = self.rows.last_mut() {
+                        row.is_constrained = true;
                     }
-                } else {
-                    columns.resize(col as usize, style_helpers::auto());
-                    columns.push(column);
                 }
+
+                style.size.width = style_helpers::auto();
+                self.cells.push(TableCell {
+                    node_id,
+                    row: self.row.saturating_sub(1),
+                    column: col,
+                    style,
+                });
+
+                self.cursor.place(colspan, rowspan);
             }
-
-            // The margin properties do not apply to table-internal elements
-            style.margin = taffy::Rect::ZERO.map(style_helpers::length);
-
-            // Let Taffy auto-place the column. Combined with
-            // `grid_auto_flow: RowDense` set on the table root, each cell
-            // scans from the first track in its row for a free position,
-            // which makes cells automatically skip columns occupied by
-            // rowspan cells from earlier rows.
-            style.grid_column = taffy::Line {
-                start: style_helpers::auto(),
-                end: style_helpers::span(colspan),
-            };
-            style.grid_row = taffy::Line {
-                start: style_helpers::line(*row as i16),
-                end: style_helpers::span(rowspan),
-            };
-            if rowspan == 1 && style.size.height.tag() == taffy::CompactLength::LENGTH_TAG {
-                if let Some(row) = rows.last_mut() {
-                    row.is_constrained = true;
-                }
+            DisplayInside::Flow
+            | DisplayInside::FlowRoot
+            | DisplayInside::Flex
+            | DisplayInside::Grid
+            | DisplayInside::GridLanes
+            | DisplayInside::Table => {
+                self.push_improper_child(style_parent_id, node_id, run);
             }
-
-            style.size.width = style_helpers::auto();
-            cells.push(TableCell {
-                node_id,
-                row: row.saturating_sub(1),
-                column: col,
-                style,
-            });
-
-            cursor.place(colspan, rowspan);
-        }
-        DisplayInside::Flow
-        | DisplayInside::FlowRoot
-        | DisplayInside::Flex
-        | DisplayInside::Grid
-        | DisplayInside::GridLanes => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            // Probably a table caption: ignore
-            // println!(
-            //     "Warning: ignoring non-table typed descendent of table ({:?})",
-            //     display.inside()
-            // );
-        }
-        DisplayInside::TableColumnGroup | DisplayInside::TableColumn | DisplayInside::Table => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            //Ignore
-        }
-        DisplayInside::None => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            // Ignore
+            DisplayInside::TableColumnGroup | DisplayInside::TableColumn => {
+                node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                run.flush_cell();
+            }
+            DisplayInside::None => {
+                node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+            }
         }
     }
 }
@@ -1083,7 +1197,7 @@ fn caption_margin_box(
         },
         parent_size,
         available_space: taffy::Size {
-            width: taffy::AvailableSpace::MaxContent,
+            width: taffy::AvailableSpace::MinContent,
             height: taffy::AvailableSpace::MaxContent,
         },
         vertical_margins_are_collapsible: taffy::Line::FALSE,

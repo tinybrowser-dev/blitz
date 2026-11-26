@@ -5758,4 +5758,68 @@ mod cascade_position_tests {
         assert_eq!(layout.size.width, 100.0);
         assert_eq!(layout.size.height, 100.0);
     }
+
+    #[test]
+    fn viewport_resize_with_display_none_descendant_does_not_panic() {
+        let mut doc = document();
+        doc.set_viewport(blitz_traits::shell::Viewport::new(
+            800,
+            600,
+            1.0,
+            ColorScheme::Light,
+        ));
+        let root = doc.root_node().id;
+        let (vh_box, hidden) = {
+            let mut mutator = doc.mutate();
+            let html = mutator.create_element(
+                qual_name!("html"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block;".into(),
+                }],
+            );
+            let body = mutator.create_element(
+                qual_name!("body"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block; margin: 0;".into(),
+                }],
+            );
+            let vh_box = mutator.create_element(
+                qual_name!("div"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: block; height: 50vh;".into(),
+                }],
+            );
+            let hidden = mutator.create_element(
+                qual_name!("div"),
+                vec![Attribute {
+                    name: qual_name!("style"),
+                    value: "display: none;".into(),
+                }],
+            );
+            mutator.append_children(body, &[vh_box, hidden]);
+            mutator.append_children(html, &[body]);
+            mutator.append_children(root, &[html]);
+            (vh_box, hidden)
+        };
+        doc.resolve(0.0);
+        assert_eq!(doc.nodes[vh_box].final_layout().size.height, 300.0);
+
+        {
+            let mut mutator = doc.mutate();
+            let late_child = mutator.create_element(qual_name!("span"), vec![]);
+            mutator.append_children(hidden, &[late_child]);
+        }
+
+        doc.set_viewport(blitz_traits::shell::Viewport::new(
+            800,
+            1200,
+            1.0,
+            ColorScheme::Light,
+        ));
+        doc.resolve(0.0);
+        assert_eq!(doc.nodes[vh_box].final_layout().size.height, 600.0);
+    }
 }

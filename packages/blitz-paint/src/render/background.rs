@@ -324,7 +324,7 @@ impl ElementCx<'_, '_> {
             .map(|row| {
                 [
                     row.group.and_then(background_color),
-                    background_color(row.node_id),
+                    row.node_id.and_then(background_color),
                 ]
             })
             .collect();
@@ -1048,13 +1048,7 @@ impl AxisTiling {
     /// spaces the images within the positioning area, then repeats that
     /// pattern to fill the painting area when that is larger
     /// (<https://drafts.csswg.org/css-backgrounds-3/#background-repeat>).
-    fn extended_to(
-        self,
-        clip_start: f64,
-        clip_len: f64,
-        tile_len: f64,
-        stride: f64,
-    ) -> AxisTiling {
+    fn extended_to(self, clip_start: f64, clip_len: f64, tile_len: f64, stride: f64) -> AxisTiling {
         // One image is placed, not repeated
         // (<https://drafts.csswg.org/css-backgrounds-3/#background-repeat>).
         if self.count == 1 || stride <= 0.0 || tile_len <= 0.0 {
