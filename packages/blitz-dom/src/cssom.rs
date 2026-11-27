@@ -389,6 +389,7 @@ impl BaseDocument {
         if sheet.0.set_disabled(disabled) {
             self.stylist
                 .force_stylesheet_origins_dirty(OriginSet::all());
+            self.has_changes = true;
         }
         true
     }
@@ -692,6 +693,7 @@ impl BaseDocument {
             // (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-replacesync>).
             self.stylist
                 .force_stylesheet_origins_dirty(OriginSet::all());
+            self.has_changes = true;
         }
         true
     }
@@ -780,6 +782,7 @@ impl BaseDocument {
         if live {
             self.stylist
                 .force_stylesheet_origins_dirty(OriginSet::all());
+            self.has_changes = true;
         }
         true
     }
@@ -802,6 +805,7 @@ impl BaseDocument {
         if record.sheet.0.set_disabled(disabled) {
             self.stylist
                 .force_stylesheet_origins_dirty(OriginSet::all());
+            self.has_changes = true;
         }
         true
     }
@@ -982,6 +986,7 @@ impl BaseDocument {
             let ancestor_refs: Vec<CssRuleRef> = ancestors.iter().map(CssRuleRef::from).collect();
             self.stylist
                 .rule_changed(&sheet, &new_rule, &guard, change_kind, &ancestor_refs);
+            self.has_changes = true;
         }
         drop(guard);
         if let Some(rule) = inserted_font_face {
@@ -1061,6 +1066,7 @@ impl BaseDocument {
             let ancestor_refs: Vec<CssRuleRef> = ancestors.iter().map(CssRuleRef::from).collect();
             self.stylist
                 .rule_changed(&sheet, &removed_rule, &guard, change_kind, &ancestor_refs);
+            self.has_changes = true;
         }
         Ok(())
     }
@@ -1323,6 +1329,7 @@ impl BaseDocument {
             let ancestor_refs: Vec<CssRuleRef> = ancestors.iter().map(CssRuleRef::from).collect();
             self.stylist
                 .rule_changed(&sheet, &rule, &guard, change_kind, &ancestor_refs);
+            self.has_changes = true;
         }
         Ok(())
     }
@@ -1393,6 +1400,7 @@ impl BaseDocument {
             let ancestor_refs: Vec<CssRuleRef> = ancestors.iter().map(CssRuleRef::from).collect();
             self.stylist
                 .rule_changed(&sheet, &rule, &guard, change_kind, &ancestor_refs);
+            self.has_changes = true;
         }
         Ok(removed_value)
     }
@@ -1476,6 +1484,7 @@ impl BaseDocument {
                 RuleChangeKind::Generic,
                 &ancestor_refs,
             );
+            self.has_changes = true;
         }
         Ok(())
     }
@@ -1526,6 +1535,7 @@ impl BaseDocument {
                 RuleChangeKind::Generic,
                 &ancestor_refs,
             );
+            self.has_changes = true;
         }
         Ok(())
     }
@@ -1596,6 +1606,7 @@ impl BaseDocument {
                 RuleChangeKind::Generic,
                 &ancestor_refs,
             );
+            self.has_changes = true;
         }
         Ok(())
     }
@@ -1670,6 +1681,7 @@ impl BaseDocument {
                 RuleChangeKind::Generic,
                 &ancestor_refs,
             );
+            self.has_changes = true;
         }
         Ok(())
     }
@@ -1726,6 +1738,7 @@ impl BaseDocument {
             };
             self.stylist
                 .rule_changed(&sheet, &rule, &guard, change_kind, &ancestor_refs);
+            self.has_changes = true;
         }
         Ok(())
     }
