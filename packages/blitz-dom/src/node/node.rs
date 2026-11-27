@@ -541,7 +541,7 @@ impl Node {
     }
 
     fn any_child_is_or_contains_block(&self) -> bool {
-        self.children
+        self.flat_children()
             .iter()
             .any(|&child_id| self.tree()[child_id].is_or_contains_block())
     }
@@ -626,19 +626,90 @@ impl Node {
         }
     }
 
-    /// Marks all ancestors of this node as having dirty descendants.
-    /// This propagates the dirty flag up the tree so that the style traversal
-    /// knows to visit the subtree containing this node.
-    pub fn flat_children(&self) -> &[NodeId] {
-        if let Some(sr_id) = self.element_data().and_then(|el| el.shadow_root) {
-            return &self.with(sr_id).children;
-        }
-        &self.children
+    // https://html.spec.whatwg.org/multipage/scripting.html#the-slot-element
+    pub fn is_html_slot(&self) -> bool {
+        self.element_data().is_some_and(|el| {
+            el.name.local == local_name!("slot") && el.name.ns == markup5ever::ns!(html)
+        })
     }
 
+    fn first_slot_with_name(&self, shadow_root_id: NodeId, desired: &str) -> Option<NodeId> {
+        let mut stack: Vec<NodeId> = self.with(shadow_root_id).children.iter().rev().copied().collect();
+        while let Some(id) = stack.pop() {
+            let node = self.with(id);
+            if node.is_html_slot() && node.attr(local_name!("name")).unwrap_or("") == desired {
+                return Some(id);
+            }
+            stack.extend(node.children.iter().rev().copied());
+        }
+        None
+    }
+
+    // https://dom.spec.whatwg.org/#find-a-slot
+    pub fn assigned_slot_id(&self) -> Option<NodeId> {
+        let desired = match &self.data {
+            NodeData::Element(el) => el.attr(local_name!("slot")).unwrap_or(""),
+            NodeData::Text(_) => "",
+            _ => return None,
+        };
+        let parent_id = self.parent?;
+        let sr_id = self.with(parent_id).element_data()?.shadow_root?;
+        self.first_slot_with_name(sr_id, desired)
+    }
+
+    // https://dom.spec.whatwg.org/#find-slottables
+    pub fn assigned_slottables(&self) -> Vec<NodeId> {
+        if !self.is_html_slot() {
+            return Vec::new();
+        }
+        let mut root_id = self.parent;
+        let (sr_id, host_id) = loop {
+            let Some(id) = root_id else {
+                return Vec::new();
+            };
+            let node = self.with(id);
+            if let NodeData::ShadowRoot { host, .. } = node.data {
+                break (id, host);
+            }
+            root_id = node.parent;
+        };
+        let desired = self.attr(local_name!("name")).unwrap_or("");
+        if self.first_slot_with_name(sr_id, desired) != Some(self.id) {
+            return Vec::new();
+        }
+        self.with(host_id)
+            .children
+            .iter()
+            .copied()
+            .filter(|&child_id| match &self.with(child_id).data {
+                NodeData::Element(el) => el.attr(local_name!("slot")).unwrap_or("") == desired,
+                NodeData::Text(_) => desired.is_empty(),
+                _ => false,
+            })
+            .collect()
+    }
+
+    // https://drafts.csswg.org/css-scoping-1/#flat-tree
+    pub fn flat_children(&self) -> std::borrow::Cow<'_, [NodeId]> {
+        if let Some(sr_id) = self.element_data().and_then(|el| el.shadow_root) {
+            return std::borrow::Cow::Borrowed(&self.with(sr_id).children);
+        }
+        if self.is_html_slot() {
+            let assigned = self.assigned_slottables();
+            if !assigned.is_empty() {
+                return std::borrow::Cow::Owned(assigned);
+            }
+        }
+        std::borrow::Cow::Borrowed(&self.children)
+    }
+
+    // https://drafts.csswg.org/css-scoping-1/#flat-tree
     pub fn flat_parent(&self) -> Option<NodeId> {
         if let NodeData::ShadowRoot { host, .. } = self.data {
             return Some(host);
+        }
+        if let Some(slot_id) = self.assigned_slot_id() {
+            return Some(slot_id);
         }
         let parent_id = self.parent?;
         if let NodeData::ShadowRoot { host, .. } = self.tree()[parent_id].data {

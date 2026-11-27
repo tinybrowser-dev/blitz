@@ -25,7 +25,6 @@ use crate::{
     },
     node::{NodeFlags, NodeKind, SpecialElementData, TextInputData, TextLayout},
     qual_name, stylo_to_parley,
-    traversal::iter_children_and_pseudos,
 };
 
 use super::{
@@ -285,16 +284,14 @@ fn push_hoisted_children_and_pseudos(
     if let Some(before) = doc.nodes[container_node_id].before() {
         push_hoisted_child(doc, before, out, wrap);
     }
-    // Take children array from node to avoid borrow checker issues.
-    let children = std::mem::take(&mut doc.nodes[container_node_id].children);
-    for child_id in children.iter().copied() {
+    let children = doc.nodes[container_node_id].flat_children().into_owned();
+    for child_id in children {
         let child = &doc.nodes[child_id];
         if child.data.kind() == NodeKind::Comment || child.is_collapsible_whitespace_node() {
             continue;
         }
         push_hoisted_child(doc, child_id, out, wrap);
     }
-    doc.nodes[container_node_id].children = children;
     if let Some(after) = doc.nodes[container_node_id].after() {
         push_hoisted_child(doc, after, out, wrap);
     }
@@ -351,7 +348,8 @@ fn classify_flow_children(
     // in the container's formatting context, and any other pseudo generates its own
     // inline or block box in that formatting context.
     let pseudo_ids = node.before().into_iter().chain(node.after());
-    let child_ids = node.flat_children().iter().copied().chain(pseudo_ids);
+    let flat_children = node.flat_children();
+    let child_ids = flat_children.iter().copied().chain(pseudo_ids);
     for child_id in child_ids {
         let child = &doc.nodes[child_id];
 
@@ -893,6 +891,23 @@ enum ChildFlow {
 }
 
 /// Handles the cases where there are text nodes or inline nodes that need to be wrapped in an anonymous block node
+fn iter_flat_children_and_pseudos_mut(
+    doc: &mut BaseDocument,
+    node_id: NodeId,
+    mut cb: impl FnMut(NodeId, &mut BaseDocument),
+) {
+    if let Some(before_id) = doc.nodes[node_id].before() {
+        cb(before_id, doc);
+    }
+    let children = doc.nodes[node_id].flat_children().into_owned();
+    for child_id in children {
+        cb(child_id, doc);
+    }
+    if let Some(after_id) = doc.nodes[node_id].after() {
+        cb(after_id, doc);
+    }
+}
+
 fn collect_complex_layout_children(
     doc: &mut BaseDocument,
     container_node_id: NodeId,
@@ -900,11 +915,7 @@ fn collect_complex_layout_children(
     child_flow: ChildFlow,
     needs_wrap: fn(&Node, DisplayOutside, bool) -> bool,
 ) {
-    let flat_target = doc.nodes[container_node_id]
-        .element_data()
-        .and_then(|el| el.shadow_root)
-        .unwrap_or(container_node_id);
-    doc.iter_children_and_pseudos_mut(flat_target, |child_id, doc| {
+    iter_flat_children_and_pseudos_mut(doc, container_node_id, |child_id, doc| {
         // Get node kind (text, element, comment, etc)
         let child_node_kind = doc.nodes[child_id].data.kind();
 
@@ -1061,13 +1072,9 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     inline_context_root_node_id: NodeId,
     layout_children: &mut ThinVec<NodeId>,
 ) {
-    let flat_target = doc.nodes[inline_context_root_node_id]
-        .element_data()
-        .and_then(|el| el.shadow_root)
-        .unwrap_or(inline_context_root_node_id);
-    flush_inline_pseudos_recursive(doc, flat_target);
+    flush_inline_pseudos_recursive(doc, inline_context_root_node_id);
 
-    iter_children_and_pseudos!(doc.nodes[flat_target], |child_id| {
+    iter_flat_children_and_pseudos_mut(doc, inline_context_root_node_id, |child_id, doc| {
         find_inline_layout_embedded_boxes_recursive(
             doc,
             inline_context_root_node_id,
@@ -1077,9 +1084,10 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     });
 
     fn flush_inline_pseudos_recursive(doc: &mut BaseDocument, node_id: NodeId) {
-        doc.iter_children_mut(node_id, |child_id, doc| {
+        let children = doc.nodes[node_id].flat_children().into_owned();
+        for child_id in children {
             flush_pseudo_elements(doc, child_id);
-            let display = doc.nodes[node_id]
+            let display = doc.nodes[child_id]
                 .display_style()
                 .unwrap_or(Display::inline());
             let do_recurse = match (display.outside(), display.inside()) {
@@ -1090,7 +1098,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
             if do_recurse {
                 flush_inline_pseudos_recursive(doc, child_id);
             }
-        });
+        }
     }
 
     fn find_inline_layout_embedded_boxes_recursive(
@@ -1168,7 +1176,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
             Action::ClearOnly => clear_stale_layout_box(doc, node_id),
             Action::ClearAndRecurseChildrenAndPseudos(next_parent) => {
                 clear_stale_layout_box(doc, node_id);
-                iter_children_and_pseudos!(doc.nodes[node_id], |child_id| {
+                iter_flat_children_and_pseudos_mut(doc, node_id, |child_id, doc| {
                     find_inline_layout_embedded_boxes_recursive(
                         doc,
                         next_parent,

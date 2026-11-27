@@ -409,30 +409,14 @@ impl selectors::Element for BlitzNode<'_> {
     }
 
     fn is_html_slot_element(&self) -> bool {
-        self.element_data()
-            .is_some_and(|el| el.name.local == local_name!("slot") && el.name.ns == ns!(html))
+        self.0.is_html_slot()
     }
 
     // https://dom.spec.whatwg.org/#find-a-slot
     fn assigned_slot(&self) -> Option<Self> {
-        let parent = selectors::Element::parent_element(self)?;
-        let shadow = parent.shadow_root()?;
-        let desired = self.0.attr(local_name!("slot")).unwrap_or("");
-        let mut stack: Vec<blitz_traits::node_id::NodeId> =
-            shadow.0.children.iter().rev().copied().collect();
-        while let Some(id) = stack.pop() {
-            let node = self.0.with(id);
-            if let Some(el) = node.element_data() {
-                if el.name.local == local_name!("slot") && el.name.ns == ns!(html) {
-                    let slot_name = el.attr(local_name!("name")).unwrap_or("");
-                    if slot_name == desired {
-                        return Some(BlitzNode(node));
-                    }
-                }
-            }
-            stack.extend(node.children.iter().rev().copied());
-        }
-        None
+        self.0
+            .assigned_slot_id()
+            .map(|id| BlitzNode(self.0.with(id)))
     }
 
     fn has_id(
@@ -458,11 +442,16 @@ impl selectors::Element for BlitzNode<'_> {
         })
     }
 
+    // https://drafts.csswg.org/css-shadow-parts/#exportparts-attr
     fn imported_part(
         &self,
-        _name: &<Self::Impl as selectors::SelectorImpl>::Identifier,
+        name: &<Self::Impl as selectors::SelectorImpl>::Identifier,
     ) -> Option<<Self::Impl as selectors::SelectorImpl>::Identifier> {
-        None
+        let attr = self.0.attr(local_name!("exportparts"))?;
+        let target: &str = name.as_ref();
+        parse_exportparts(attr)
+            .find(|(_, exported)| *exported == target)
+            .map(|(inner, _)| AtomIdent::from(inner))
     }
 
     fn is_part(&self, name: &<Self::Impl as selectors::SelectorImpl>::Identifier) -> bool {
@@ -552,9 +541,29 @@ impl<'a> TElement for BlitzNode<'a> {
     }
 
     fn traversal_children(&self) -> style::dom::LayoutIterator<Self::TraversalChildrenIterator> {
+        let children = if let Some(sr_id) = self.element_data().and_then(|el| el.shadow_root) {
+            let sr_children = &self.0.with(sr_id).children;
+            let unslotted: Vec<_> = self
+                .0
+                .children
+                .iter()
+                .copied()
+                .filter(|&id| self.0.with(id).assigned_slot_id().is_none())
+                .collect();
+            if unslotted.is_empty() {
+                std::borrow::Cow::Borrowed(sr_children.as_slice())
+            } else {
+                let mut combined = Vec::with_capacity(sr_children.len() + unslotted.len());
+                combined.extend_from_slice(sr_children);
+                combined.extend(unslotted);
+                std::borrow::Cow::Owned(combined)
+            }
+        } else {
+            self.0.flat_children()
+        };
         LayoutIterator(Traverser {
-            // dom: self.tree(),
             parent: *self,
+            children,
             child_index: 0,
         })
     }
@@ -601,8 +610,25 @@ impl<'a> TElement for BlitzNode<'a> {
         }
     }
 
+    // https://drafts.csswg.org/css-shadow-parts/#exportparts-attr
     fn exports_any_part(&self) -> bool {
-        false
+        self.0.attr(local_name!("exportparts")).is_some()
+    }
+
+    // https://drafts.csswg.org/css-shadow-parts/#exportparts-attr
+    fn each_exported_part<F>(&self, name: &style::values::AtomIdent, mut callback: F)
+    where
+        F: FnMut(&style::values::AtomIdent),
+    {
+        if let Some(attr) = self.0.attr(local_name!("exportparts")) {
+            let target: &str = name.as_ref();
+            for (inner, exported) in parse_exportparts(attr) {
+                if inner == target {
+                    let atom = style::Atom::from(exported);
+                    callback(AtomIdent::cast(&atom));
+                }
+            }
+        }
     }
 
     fn id(&self) -> Option<&style::Atom> {
@@ -918,9 +944,41 @@ impl<'a> TElement for BlitzNode<'a> {
     // }
 }
 
+// https://drafts.csswg.org/css-shadow-parts/#parsing-mapping-list
+fn parse_exportparts(input: &str) -> impl Iterator<Item = (&str, &str)> {
+    input.split(',').filter_map(|raw| {
+        let s = raw.trim_start_matches(' ');
+        if s.is_empty() {
+            return None;
+        }
+        let split = s
+            .char_indices()
+            .find(|(_, c)| matches!(c, ' ' | ':'))
+            .map_or(s.len(), |(idx, _)| idx);
+        let (first, rest) = s.split_at(split);
+        if first.is_empty() {
+            return None;
+        }
+        let rest = rest.trim_start_matches(' ');
+        if rest.is_empty() {
+            return Some((first, first));
+        }
+        let rest = rest.strip_prefix(':')?.trim_start_matches(' ');
+        let split2 = rest
+            .char_indices()
+            .find(|(_, c)| matches!(c, ' ' | ':'))
+            .map_or(rest.len(), |(idx, _)| idx);
+        let (second, tail) = rest.split_at(split2);
+        if second.is_empty() || !tail.trim_start_matches(' ').is_empty() {
+            return None;
+        }
+        Some((first, second))
+    })
+}
+
 pub(crate) struct Traverser<'a> {
-    // dom: &'a Slab<Node>,
     parent: BlitzNode<'a>,
+    children: std::borrow::Cow<'a, [blitz_traits::node_id::NodeId]>,
     child_index: usize,
 }
 
@@ -928,23 +986,9 @@ impl<'a> Iterator for Traverser<'a> {
     type Item = BlitzNode<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let flat = self.parent.flat_children();
-        let node_id = if let Some(id) = flat.get(self.child_index) {
-            *id
-        } else if self
-            .parent
-            .element_data()
-            .is_some_and(|el| el.shadow_root.is_some())
-        {
-            *self.parent.children.get(self.child_index - flat.len())?
-        } else {
-            return None;
-        };
-        let node = self.parent.0.with(node_id);
-
+        let node_id = *self.children.get(self.child_index)?;
         self.child_index += 1;
-
-        Some(BlitzNode(node))
+        Some(BlitzNode(self.parent.0.with(node_id)))
     }
 }
 
