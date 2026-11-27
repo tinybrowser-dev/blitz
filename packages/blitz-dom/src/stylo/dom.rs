@@ -105,10 +105,10 @@ impl<'a> TShadowRoot for BlitzNode<'a> {
     where
         Self: 'b,
     {
-        // Shadow-scoped cascade data is not built yet. `None` keeps
-        // document author rules out of the shadow tree
-        // (<https://drafts.csswg.org/css-scoping/#shadow-trees>).
-        None
+        let NodeData::ShadowRoot { author_styles, .. } = &self.0.data else {
+            return None;
+        };
+        Some(&author_styles.0.data)
     }
 }
 
@@ -409,7 +409,30 @@ impl selectors::Element for BlitzNode<'_> {
     }
 
     fn is_html_slot_element(&self) -> bool {
-        false
+        self.element_data()
+            .is_some_and(|el| el.name.local == local_name!("slot") && el.name.ns == ns!(html))
+    }
+
+    // https://dom.spec.whatwg.org/#find-a-slot
+    fn assigned_slot(&self) -> Option<Self> {
+        let parent = selectors::Element::parent_element(self)?;
+        let shadow = parent.shadow_root()?;
+        let desired = self.0.attr(local_name!("slot")).unwrap_or("");
+        let mut stack: Vec<blitz_traits::node_id::NodeId> =
+            shadow.0.children.iter().rev().copied().collect();
+        while let Some(id) = stack.pop() {
+            let node = self.0.with(id);
+            if let Some(el) = node.element_data() {
+                if el.name.local == local_name!("slot") && el.name.ns == ns!(html) {
+                    let slot_name = el.attr(local_name!("name")).unwrap_or("");
+                    if slot_name == desired {
+                        return Some(BlitzNode(node));
+                    }
+                }
+            }
+            stack.extend(node.children.iter().rev().copied());
+        }
+        None
     }
 
     fn has_id(
@@ -442,8 +465,11 @@ impl selectors::Element for BlitzNode<'_> {
         None
     }
 
-    fn is_part(&self, _name: &<Self::Impl as selectors::SelectorImpl>::Identifier) -> bool {
-        false
+    fn is_part(&self, name: &<Self::Impl as selectors::SelectorImpl>::Identifier) -> bool {
+        let target: &str = name.as_ref();
+        self.0
+            .attr(local_name!("part"))
+            .is_some_and(|attr| attr.split_ascii_whitespace().any(|token| token == target))
     }
 
     fn is_empty(&self) -> bool {
@@ -519,14 +545,10 @@ impl<'a> TElement for BlitzNode<'a> {
     }
 
     fn implicit_scope_for_sheet_in_shadow_root(
-        _opaque_host: OpaqueElement,
+        opaque_host: OpaqueElement,
         _sheet_index: usize,
     ) -> Option<ImplicitScopeRoot> {
-        // We cannot currently implement this as we are using the NodeId as the OpaqueElement,
-        // and need a reference to the Slab to convert it back into an Element
-        //
-        // Luckily it is only needed for shadow dom.
-        todo!();
+        Some(ImplicitScopeRoot::InShadowTree(opaque_host))
     }
 
     fn traversal_children(&self) -> style::dom::LayoutIterator<Self::TraversalChildrenIterator> {
@@ -564,7 +586,19 @@ impl<'a> TElement for BlitzNode<'a> {
     }
 
     fn has_part_attr(&self) -> bool {
-        false
+        self.0.attr(local_name!("part")).is_some()
+    }
+
+    fn each_part<F>(&self, mut callback: F)
+    where
+        F: FnMut(&style::values::AtomIdent),
+    {
+        if let Some(attr) = self.0.attr(local_name!("part")) {
+            for token in attr.split_ascii_whitespace() {
+                let atom = style::Atom::from(token);
+                callback(AtomIdent::cast(&atom));
+            }
+        }
     }
 
     fn exports_any_part(&self) -> bool {

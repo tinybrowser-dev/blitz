@@ -1752,14 +1752,12 @@ impl<'doc> DocumentMutator<'doc> {
             // Custom post-processing by element tag name
             let tag = element.name.local.as_ref();
             match tag {
-                "title" => self.title_node = Some(node_id),
-                "style" if !in_shadow => {
+                "title" if !in_shadow => self.title_node = Some(node_id),
+                "style" => {
                     self.style_nodes.insert(node_id);
                 }
                 _ if has_custom_widget => {}
-                "link" if !in_shadow => {
-                    self.eager_op_queue.push(SpecialOp::LoadStylesheet(node_id))
-                }
+                "link" => self.eager_op_queue.push(SpecialOp::LoadStylesheet(node_id)),
                 "img" => self.eager_op_queue.push(SpecialOp::LoadImage(node_id)),
                 "image" | "feImage" if cfg!(feature = "svg") && element.name.ns == ns!(svg) => {
                     self.eager_op_queue.push(SpecialOp::LoadImage(node_id))
@@ -1912,7 +1910,13 @@ impl<'doc> DocumentMutator<'doc> {
     /// Attach a shadow root to `host`. The root is not a child of the host
     /// (<https://dom.spec.whatwg.org/#concept-attach-a-shadow-root>).
     pub fn attach_shadow_root(&mut self, host: NodeId, closed: bool) -> NodeId {
-        let id = self.doc.create_node(NodeData::ShadowRoot { host, closed });
+        let id = self.doc.create_node(NodeData::ShadowRoot {
+            host,
+            closed,
+            author_styles: crate::node::ShadowStyles::default(),
+            adopted_stylesheets: Vec::new(),
+        });
+        self.doc.shadow_roots.push(id);
         if let Some(element) = self.doc.nodes[host].element_data_mut() {
             element.shadow_root = Some(id);
         }
@@ -2016,14 +2020,11 @@ impl<'doc> DocumentMutator<'doc> {
         };
 
         match tag_name.as_ref() {
-            "title" => self.title_node = Some(node_id),
+            "title" if !self.inside_shadow(node_id) => self.title_node = Some(node_id),
             // A `<style>` element applies only while it is in the document; a
             // text change on a detached one must not attach a sheet
             // (<https://html.spec.whatwg.org/multipage/semantics.html#the-style-element>).
-            "style"
-                if !self.inside_shadow(node_id)
-                    && self.doc.nodes[node_id].flags.is_in_document() =>
-            {
+            "style" if self.doc.nodes[node_id].flags.is_in_document() => {
                 self.style_nodes.insert(node_id);
             }
             _ => {}
@@ -2137,12 +2138,32 @@ impl<'doc> DocumentMutator<'doc> {
             }
         };
 
+        if let Some((shadow_id, old_sheet)) = self.doc.shadow_nodes_to_stylesheet.remove(&node_id) {
+            if let Some(NodeData::ShadowRoot { author_styles, .. }) =
+                self.doc.nodes.get_mut(shadow_id).map(|node| &mut node.data)
+            {
+                let guard = self.doc.guard.read();
+                author_styles.0.stylesheets.remove_stylesheet(
+                    None,
+                    author_styles.0.data.custom_media_map(),
+                    old_sheet,
+                    &guard,
+                );
+                author_styles.0.stylesheets.force_dirty();
+            }
+            self.doc.mark_shadow_tree_dirty(shadow_id);
+            self.doc.detach_cssom_sheet(node_id);
+            self.doc.stylesheet_generation += 1;
+            return;
+        }
+
         let guard = self.doc.guard.read();
         self.doc.stylist.remove_stylesheet(stylesheet, &guard);
         self.doc
             .stylist
             .force_stylesheet_origins_dirty(OriginSet::all());
         drop(guard);
+        self.doc.has_changes = true;
 
         self.doc.nodes_to_stylesheet.remove(&node_id);
         // The CSSOM sheet object outlives the owner. It stays readable and
@@ -2161,12 +2182,32 @@ impl<'doc> DocumentMutator<'doc> {
             return;
         };
 
+        if let Some((shadow_id, old_sheet)) = self.doc.shadow_nodes_to_stylesheet.remove(&node_id) {
+            if let Some(NodeData::ShadowRoot { author_styles, .. }) =
+                self.doc.nodes.get_mut(shadow_id).map(|node| &mut node.data)
+            {
+                let guard = self.doc.guard.read();
+                author_styles.0.stylesheets.remove_stylesheet(
+                    None,
+                    author_styles.0.data.custom_media_map(),
+                    old_sheet,
+                    &guard,
+                );
+                author_styles.0.stylesheets.force_dirty();
+            }
+            self.doc.mark_shadow_tree_dirty(shadow_id);
+            self.doc.detach_cssom_sheet(node_id);
+            self.doc.stylesheet_generation += 1;
+            return;
+        }
+
         let guard = self.doc.guard.read();
         self.doc.stylist.remove_stylesheet(stylesheet, &guard);
         self.doc
             .stylist
             .force_stylesheet_origins_dirty(OriginSet::all());
         drop(guard);
+        self.doc.has_changes = true;
 
         self.doc.detach_cssom_sheet(node_id);
         self.doc.stylesheet_generation += 1;

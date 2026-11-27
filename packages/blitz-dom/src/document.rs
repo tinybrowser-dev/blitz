@@ -370,6 +370,10 @@ pub struct BaseDocument {
     pub(crate) nodes_to_id: HashMap<String, SmallVec<[NodeId; 1]>>,
     /// Map of `<style>` and `<link>` node IDs to their associated stylesheet
     pub(crate) nodes_to_stylesheet: BTreeMap<NodeId, DocumentStyleSheet>,
+    /// Map of shadow-tree `<style>` and `<link>` node IDs to `(shadow_root, stylesheet)`.
+    pub(crate) shadow_nodes_to_stylesheet: BTreeMap<NodeId, (NodeId, DocumentStyleSheet)>,
+    /// Shadow root nodes attached in this document whose `AuthorStyles` may need flushing.
+    pub(crate) shadow_roots: Vec<NodeId>,
     /// The document's adopted stylesheets, in cascade order. They apply after
     /// every stylesheet an element owns
     /// (<https://drafts.csswg.org/cssom/#extensions-to-the-document-or-shadow-root-interface>).
@@ -785,6 +789,8 @@ impl BaseDocument {
             devtool_settings: DevtoolSettings::default(),
             url: base_url,
             nodes_to_stylesheet: BTreeMap::new(),
+            shadow_nodes_to_stylesheet: BTreeMap::new(),
+            shadow_roots: Vec::new(),
             adopted_stylesheets: Vec::new(),
             stylesheet_generation: 0,
             cssom_sheets: HashMap::new(),
@@ -1923,6 +1929,7 @@ impl BaseDocument {
                 sheet: stylesheet,
                 origin_clean,
                 live: true,
+                shadow_roots: Vec::new(),
                 owner: Some(node_id),
                 constructable: false,
             },
@@ -1947,7 +1954,48 @@ impl BaseDocument {
         };
         if let Some(record) = self.cssom_sheets.get_mut(&id) {
             record.live = false;
+            record.shadow_roots.clear();
         }
+    }
+
+    pub(crate) fn containing_shadow_root(&self, node_id: NodeId) -> Option<NodeId> {
+        let mut current = self.nodes.get(node_id)?.parent;
+        while let Some(id) = current {
+            let node = self.nodes.get(id)?;
+            if matches!(node.data, NodeData::ShadowRoot { .. }) {
+                return Some(id);
+            }
+            current = node.parent;
+        }
+        None
+    }
+
+    pub(crate) fn mark_shadow_tree_dirty(&mut self, shadow_id: NodeId) {
+        let Some(NodeData::ShadowRoot { host, .. }) =
+            self.nodes.get(shadow_id).map(|node| &node.data)
+        else {
+            return;
+        };
+        let host = *host;
+        let shadow_children = self.nodes[shadow_id].children.clone();
+        let light_children = self
+            .nodes
+            .get(host)
+            .map(|node| node.children.clone())
+            .unwrap_or_default();
+        if let Some(host_node) = self.nodes.get_mut(host) {
+            host_node.set_restyle_hint(style::invalidation::element::restyle_hints::RestyleHint::restyle_subtree());
+            host_node.insert_damage(ALL_DAMAGE);
+            host_node.mark_ancestors_dirty();
+        }
+        for child in shadow_children.into_iter().chain(light_children) {
+            if let Some(node) = self.nodes.get_mut(child) {
+                node.set_restyle_hint(style::invalidation::element::restyle_hints::RestyleHint::restyle_subtree());
+                node.insert_damage(ALL_DAMAGE);
+                node.mark_ancestors_dirty();
+            }
+        }
+        self.has_changes = true;
     }
 
     /// Whether `earlier` comes before `later` in tree order
@@ -2022,6 +2070,73 @@ impl BaseDocument {
     }
 
     pub fn add_stylesheet_for_node(&mut self, stylesheet: DocumentStyleSheet, node_id: NodeId) {
+        if let Some(shadow_id) = self.containing_shadow_root(node_id) {
+            let cssom_sheet = self.retain_cssom_sheet(stylesheet.clone(), node_id, true);
+            if let Some(record) = self.cssom_sheets.get_mut(&cssom_sheet) {
+                record.live = false;
+                record.shadow_roots.push(shadow_id);
+            }
+            let old = self
+                .shadow_nodes_to_stylesheet
+                .insert(node_id, (shadow_id, stylesheet.clone()));
+            self.stylesheet_generation += 1;
+            self.load_sheet_font_faces(&stylesheet, Some(node_id), cssom_sheet);
+            if let Some(element) = self.nodes[node_id].element_data_mut() {
+                element.special_data = SpecialElementData::Stylesheet(stylesheet.clone());
+            }
+            let insertion_point = self
+                .shadow_nodes_to_stylesheet
+                .iter()
+                .filter(|(owner, (sr, _))| {
+                    *sr == shadow_id
+                        && **owner != node_id
+                        && self.precedes_in_tree_order(node_id, **owner)
+                })
+                .min_by(|(left, _), (right, _)| {
+                    if self.precedes_in_tree_order(**left, **right) {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                })
+                .map(|(_, (_, sheet))| sheet.clone());
+            if let Some(NodeData::ShadowRoot {
+                author_styles,
+                adopted_stylesheets,
+                ..
+            }) = self.nodes.get_mut(shadow_id).map(|node| &mut node.data)
+            {
+                let guard = self.guard.read();
+                if let Some((_, old_sheet)) = old {
+                    author_styles.0.stylesheets.remove_stylesheet(
+                        None,
+                        author_styles.0.data.custom_media_map(),
+                        old_sheet,
+                        &guard,
+                    );
+                }
+                if let Some(before) = insertion_point {
+                    author_styles
+                        .0
+                        .stylesheets
+                        .insert_stylesheet_before(stylesheet, before, &guard);
+                } else if let Some(first_adopted) = adopted_stylesheets.first().cloned() {
+                    author_styles.0.stylesheets.insert_stylesheet_before(
+                        stylesheet,
+                        first_adopted,
+                        &guard,
+                    );
+                } else {
+                    author_styles
+                        .0
+                        .stylesheets
+                        .append_stylesheet(stylesheet, &guard);
+                }
+                author_styles.0.stylesheets.force_dirty();
+            }
+            self.mark_shadow_tree_dirty(shadow_id);
+            return;
+        }
         // Inline sheets are same-document. A fetched `<link>` sheet overwrites
         // this with the response URL's origin-clean flag before script runs
         // (<https://drafts.csswg.org/cssom/#concept-css-style-sheet-origin-clean-flag>).

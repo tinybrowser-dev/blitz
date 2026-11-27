@@ -44,6 +44,25 @@ impl crate::document::BaseDocument {
     pub fn resolve_stylist(&mut self, now: f64) {
         style::thread_state::enter(ThreadState::LAYOUT);
 
+        self.shadow_roots.retain(|id| self.nodes.contains_key(*id));
+        let shadow_ids = self.shadow_roots.clone();
+        let mut flushed_shadows = Vec::new();
+        {
+            let author_guard = self.guard.read();
+            for shadow_id in shadow_ids {
+                if let Some(crate::node::NodeData::ShadowRoot { author_styles, .. }) =
+                    self.nodes.get_mut(shadow_id).map(|node| &mut node.data)
+                    && author_styles.0.stylesheets.dirty()
+                {
+                    author_styles.0.flush(&mut self.stylist, &author_guard);
+                    flushed_shadows.push(shadow_id);
+                }
+            }
+        }
+        for shadow_id in flushed_shadows {
+            self.mark_shadow_tree_dirty(shadow_id);
+        }
+
         let guard = &self.guard;
         let guards = StylesheetGuards {
             author: &guard.read(),
@@ -51,7 +70,6 @@ impl crate::document::BaseDocument {
         };
 
         let root = BlitzNode(self.nodes[self.root_node_id].first_element_child().unwrap());
-
         self.stylist
             .flush(&guards)
             .process_style(root, Some(&self.snapshots));

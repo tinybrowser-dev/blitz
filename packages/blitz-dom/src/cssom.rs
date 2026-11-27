@@ -45,6 +45,10 @@ pub(crate) struct CssomSheetRecord {
     pub sheet: DocumentStyleSheet,
     pub origin_clean: bool,
     pub live: bool,
+    /// Shadow roots whose `AuthorStyles` currently include this sheet (either
+    /// owned by a `<style>`/`<link>` inside the shadow tree or adopted via
+    /// `ShadowRoot.adoptedStyleSheets`).
+    pub shadow_roots: Vec<NodeId>,
     /// The element that owns this sheet, or `None` for a sheet reached only
     /// through an `@import` rule or created by the `CSSStyleSheet` constructor
     /// (<https://drafts.csswg.org/cssom/#dom-stylesheet-ownernode>).
@@ -340,9 +344,30 @@ impl BaseDocument {
         owners
     }
 
+    /// The owner nodes (`<style>` / `<link>` elements) of `shadow_root`'s
+    /// author stylesheets (`shadowRoot.styleSheets`), in tree order.
+    pub fn shadow_stylesheet_owner_nodes(&self, shadow_root: NodeId) -> Vec<NodeId> {
+        let mut owners: Vec<NodeId> = self
+            .shadow_nodes_to_stylesheet
+            .iter()
+            .filter_map(|(owner, (sr, _))| (*sr == shadow_root).then_some(*owner))
+            .collect();
+        owners.sort_by(|left, right| {
+            if self.precedes_in_tree_order(*left, *right) {
+                std::cmp::Ordering::Less
+            } else if self.precedes_in_tree_order(*right, *left) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        owners
+    }
+
     /// Whether `node_id` currently owns a stylesheet
     pub fn node_has_stylesheet(&self, node_id: NodeId) -> bool {
         self.nodes_to_stylesheet.contains_key(&node_id)
+            || self.shadow_nodes_to_stylesheet.contains_key(&node_id)
     }
 
     /// A counter which changes whenever the set of stylesheets (or the
@@ -374,6 +399,7 @@ impl BaseDocument {
     pub fn stylesheet_disabled(&self, node_id: NodeId) -> bool {
         self.nodes_to_stylesheet
             .get(&node_id)
+            .or_else(|| self.shadow_nodes_to_stylesheet.get(&node_id).map(|(_, s)| s))
             .is_some_and(|sheet| sheet.0.disabled())
     }
 
@@ -383,6 +409,18 @@ impl BaseDocument {
     ///
     /// Returns `false` if the node owns no stylesheet.
     pub fn set_stylesheet_disabled(&mut self, node_id: NodeId, disabled: bool) -> bool {
+        if let Some((shadow_id, sheet)) = self.shadow_nodes_to_stylesheet.get(&node_id) {
+            let shadow_id = *shadow_id;
+            if sheet.0.set_disabled(disabled) {
+                if let Some(crate::node::NodeData::ShadowRoot { author_styles, .. }) =
+                    self.nodes.get_mut(shadow_id).map(|node| &mut node.data)
+                {
+                    author_styles.0.stylesheets.force_dirty();
+                }
+                self.mark_shadow_tree_dirty(shadow_id);
+            }
+            return true;
+        }
         let Some(sheet) = self.nodes_to_stylesheet.get(&node_id) else {
             return false;
         };
@@ -392,6 +430,24 @@ impl BaseDocument {
             self.has_changes = true;
         }
         true
+    }
+
+    fn dirty_sheet_shadows(&mut self, sheet_id: u64) {
+        let Some(shadow_roots) = self
+            .cssom_sheets
+            .get(&sheet_id)
+            .map(|record| record.shadow_roots.clone())
+        else {
+            return;
+        };
+        for shadow_id in shadow_roots {
+            if let Some(crate::node::NodeData::ShadowRoot { author_styles, .. }) =
+                self.nodes.get_mut(shadow_id).map(|node| &mut node.data)
+            {
+                author_styles.0.stylesheets.force_dirty();
+            }
+            self.mark_shadow_tree_dirty(shadow_id);
+        }
     }
 
     fn stylesheet_loader(&self) -> StylesheetLoader {
@@ -543,6 +599,7 @@ impl BaseDocument {
                 sheet: sheet.clone(),
                 origin_clean,
                 live: true,
+                shadow_roots: Vec::new(),
                 owner: None,
                 constructable: false,
             },
@@ -650,6 +707,7 @@ impl BaseDocument {
                 // (<https://drafts.csswg.org/cssom/#concept-css-style-sheet-origin-clean-flag>).
                 origin_clean: true,
                 live: false,
+                shadow_roots: Vec::new(),
                 owner: None,
                 constructable: true,
             },
@@ -695,6 +753,7 @@ impl BaseDocument {
                 .force_stylesheet_origins_dirty(OriginSet::all());
             self.has_changes = true;
         }
+        self.dirty_sheet_shadows(sheet_id);
         true
     }
 
@@ -744,6 +803,63 @@ impl BaseDocument {
         true
     }
 
+    /// Replaces `shadow_root`'s adopted stylesheet list with the constructable
+    /// CSSOM sheets named by `ids`
+    /// (<https://drafts.csswg.org/cssom/#extensions-to-the-document-or-shadow-root-interface>).
+    pub fn set_shadow_adopted_stylesheets(&mut self, shadow_root: NodeId, ids: &[u64]) -> bool {
+        if !matches!(
+            self.nodes.get(shadow_root).map(|node| &node.data),
+            Some(crate::node::NodeData::ShadowRoot { .. })
+        ) {
+            return false;
+        }
+        let mut sheets = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(record) = self.cssom_sheets.get(id) else {
+                return false;
+            };
+            if !record.constructable {
+                return false;
+            }
+            sheets.push(record.sheet.clone());
+        }
+        if let Some(crate::node::NodeData::ShadowRoot {
+            author_styles,
+            adopted_stylesheets,
+            ..
+        }) = self.nodes.get_mut(shadow_root).map(|node| &mut node.data)
+        {
+            let old = std::mem::take(adopted_stylesheets);
+            let guard = self.guard.read();
+            for sheet in &old {
+                author_styles.0.stylesheets.remove_stylesheet(
+                    None,
+                    author_styles.0.data.custom_media_map(),
+                    sheet.clone(),
+                    &guard,
+                );
+            }
+            for sheet in &sheets {
+                author_styles
+                    .0
+                    .stylesheets
+                    .append_stylesheet(sheet.clone(), &guard);
+            }
+            author_styles.0.stylesheets.force_dirty();
+            *adopted_stylesheets = sheets.clone();
+        }
+        for record in self.cssom_sheets.values_mut() {
+            if record.constructable {
+                record.shadow_roots.retain(|id| *id != shadow_root);
+                if sheets.contains(&record.sheet) {
+                    record.shadow_roots.push(shadow_root);
+                }
+            }
+        }
+        self.mark_shadow_tree_dirty(shadow_root);
+        true
+    }
+
     /// The CSSOM ids of the document's adopted stylesheets, in cascade order.
     pub fn adopted_stylesheet_ids(&self) -> Vec<u64> {
         self.adopted_stylesheets
@@ -784,6 +900,7 @@ impl BaseDocument {
                 .force_stylesheet_origins_dirty(OriginSet::all());
             self.has_changes = true;
         }
+        self.dirty_sheet_shadows(sheet_id);
         true
     }
 
@@ -806,6 +923,7 @@ impl BaseDocument {
             self.stylist
                 .force_stylesheet_origins_dirty(OriginSet::all());
             self.has_changes = true;
+            self.dirty_sheet_shadows(sheet_id);
         }
         true
     }
@@ -989,6 +1107,7 @@ impl BaseDocument {
             self.has_changes = true;
         }
         drop(guard);
+        self.dirty_sheet_shadows(sheet_id);
         if let Some(rule) = inserted_font_face {
             // The rule's CSSOM address is the list's path plus its index;
             // its outcome reports there.
@@ -1068,6 +1187,8 @@ impl BaseDocument {
                 .rule_changed(&sheet, &removed_rule, &guard, change_kind, &ancestor_refs);
             self.has_changes = true;
         }
+        drop(guard);
+        self.dirty_sheet_shadows(sheet_id);
         Ok(())
     }
 
@@ -1331,6 +1452,8 @@ impl BaseDocument {
                 .rule_changed(&sheet, &rule, &guard, change_kind, &ancestor_refs);
             self.has_changes = true;
         }
+        drop(guard);
+        self.dirty_sheet_shadows(sheet_id);
         Ok(())
     }
 
@@ -1402,6 +1525,8 @@ impl BaseDocument {
                 .rule_changed(&sheet, &rule, &guard, change_kind, &ancestor_refs);
             self.has_changes = true;
         }
+        drop(guard);
+        self.dirty_sheet_shadows(sheet_id);
         Ok(removed_value)
     }
 
@@ -1486,6 +1611,8 @@ impl BaseDocument {
             );
             self.has_changes = true;
         }
+        drop(guard);
+        self.dirty_sheet_shadows(id);
         Ok(())
     }
 
@@ -1537,6 +1664,8 @@ impl BaseDocument {
             );
             self.has_changes = true;
         }
+        drop(guard);
+        self.dirty_sheet_shadows(sheet_id);
         Ok(())
     }
 
@@ -1608,6 +1737,8 @@ impl BaseDocument {
             );
             self.has_changes = true;
         }
+        drop(guard);
+        self.dirty_sheet_shadows(sheet_id);
         Ok(())
     }
 
@@ -1683,6 +1814,8 @@ impl BaseDocument {
             );
             self.has_changes = true;
         }
+        drop(guard);
+        self.dirty_sheet_shadows(sheet_id);
         Ok(())
     }
 
@@ -1740,6 +1873,8 @@ impl BaseDocument {
                 .rule_changed(&sheet, &rule, &guard, change_kind, &ancestor_refs);
             self.has_changes = true;
         }
+        drop(guard);
+        self.dirty_sheet_shadows(sheet_id);
         Ok(())
     }
 }

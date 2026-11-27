@@ -926,6 +926,30 @@ pub enum NodeKind {
     ShadowRoot,
 }
 
+/// Shadow-root-scoped author stylesheets and cascade data
+/// (<https://drafts.csswg.org/css-scoping/#shadow-trees>).
+pub struct ShadowStyles(
+    pub Box<style::author_styles::AuthorStyles<style::stylesheets::DocumentStyleSheet>>,
+);
+
+impl Default for ShadowStyles {
+    fn default() -> Self {
+        Self(Box::new(style::author_styles::AuthorStyles::new()))
+    }
+}
+
+impl std::fmt::Debug for ShadowStyles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ShadowStyles")
+    }
+}
+
+impl Clone for ShadowStyles {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 /// The different kinds of nodes in the DOM.
 #[derive(Debug, Clone)]
 pub enum NodeData {
@@ -1002,6 +1026,10 @@ pub enum NodeData {
         host: NodeId,
         /// `true` when the mode is `"closed"`.
         closed: bool,
+        /// Shadow-scoped `<style>` and adopted stylesheets plus their compiled cascade data.
+        author_styles: ShadowStyles,
+        /// Adopted stylesheets for this shadow root, in cascade order.
+        adopted_stylesheets: Vec<style::stylesheets::DocumentStyleSheet>,
     },
 }
 
@@ -1167,10 +1195,13 @@ impl Node {
 
     /// The root of the tree containing the node: the document node, for a node in the document.
     pub fn owner_doc(&self) -> &Node {
-        // Walk up the (layout-)parent chain to the root Document node.
+        // Walk up the (layout-)parent chain to the root Document node. A
+        // shadow root is not a child of its host, so `flat_parent` is what
+        // reaches the host and then the document
+        // (<https://dom.spec.whatwg.org/#concept-node-document>).
         let mut node = self;
-        while let Some(parent) = node.parent_node() {
-            node = parent;
+        while let Some(parent_id) = node.flat_parent() {
+            node = node.with(parent_id);
         }
         node
     }
